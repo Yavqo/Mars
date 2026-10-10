@@ -1,0 +1,2 @@
+-- The schema lives in lib/db.ts and is applied automatically on first query.
+-- Search ranking is documented in lib/search.ts (rankedSql).
