@@ -8,7 +8,8 @@
     "build": "next build",
     "start": "next start -p 4174",
     "worker": "tsx --env-file=.env.local scripts/worker.ts",
-    "classify": "tsx --env-file=.env.local scripts/classify.ts"
+    "classify": "tsx --env-file=.env.local scripts/classify.ts",
+    "test:crawler": "node --test tests/crawler.test.cjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.2.0",

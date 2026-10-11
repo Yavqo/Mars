@@ -46,6 +46,9 @@ const SCHEMA = [
     status     TEXT NOT NULL DEFAULT 'pending',
     added_at   TIMESTAMPTZ NOT NULL DEFAULT now()
   )`,
+  `ALTER TABLE crawl_queue ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ`,
+  `CREATE INDEX IF NOT EXISTS pages_host_idx ON pages (host)`,
+  `CREATE INDEX IF NOT EXISTS crawl_jobs_created_idx ON crawl_jobs (created_at DESC)`,
   `CREATE INDEX IF NOT EXISTS crawl_queue_pending_idx ON crawl_queue (id) WHERE status = 'pending'`,
   // What people searched (the words only: no IP, no account). Feeds suggestions, trending and spelling help.
   `CREATE TABLE IF NOT EXISTS search_log (

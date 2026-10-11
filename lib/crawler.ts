@@ -16,7 +16,7 @@ const TIMEOUT_MS = 12_000;
 const BASE_DELAY_MS = Number(process.env.CRAWLER_DELAY_MS) || 1000;   // between requests to one host
 const MAX_DELAY_MS = 15_000;
 const PER_HOST = 2;                                                    // requests in flight per host (1 once a host pushes back)
-const CONCURRENCY = 4;                                                 // across all hosts
+const CONCURRENCY = Math.min(32, Math.max(1, Number(process.env.CRAWLER_CONCURRENCY) || 4));                                                 // across all hosts
 const MAX_BLOCKS = 4;                                                  // consecutive 403/429/503 before giving up on a host
 const SKIP_EXT = /\.(jpe?g|png|gif|webp|svg|ico|pdf|zip|gz|tar|mp[34]|mov|avi|wav|css|js|json|xml|woff2?|ttf|eot|exe|dmg|apk|docx?|xlsx?|pptx?|rss|atom)(\?|$)/i;
 // Login pages, carts, internal search and similar: endless, repetitive, or not meant for indexing.
@@ -99,7 +99,7 @@ function parseRobots(txt: string): Robots {
     if (!cur) continue;
     if (key === "disallow" && val) cur.rules.push({ allow: false, path: val });
     else if (key === "allow" && val) cur.rules.push({ allow: true, path: val });
-    else if (key === "crawl-delay") cur.delay = Math.min(Number(val) || 0, 5) * 1000;
+    else if (key === "crawl-delay") cur.delay = Math.max(Number(val) || 0, 0) * 1000;
   }
   const pick = groups.find((x) => x.agents.includes("marsbot")) ?? groups.find((x) => x.agents.includes("*"));
   return { rules: pick?.rules ?? [], delay: pick?.delay ?? 0, sitemaps };
@@ -274,6 +274,21 @@ export async function refreshAuthority(): Promise<void> {
 
 type Item = { url: string; depth: number; tries: number; bonus: number };
 type HostState = { delay: number; nextAt: number; active: number; blocks: number; dead: boolean };
+// Jobs in this process share pacing, including jobs started from the admin page.
+const sharedHosts = new Map<string, HostState>();
+let maintenanceAt = 0;
+let maintenance: Promise<void> | undefined;
+async function maintainIndex() {
+  if (maintenance) return maintenance;
+  if (Date.now() - maintenanceAt < 15 * 60_000) return;
+  maintenance = (async () => {
+    await refreshAuthority();
+    await refreshVocab();
+    maintenanceAt = Date.now();
+  })().catch((error) => console.error("[crawler] index maintenance failed", error))
+    .finally(() => { maintenance = undefined; });
+  return maintenance;
+}
 
 export async function runCrawl(o: CrawlOptions): Promise<void> {
   const ctl: Control = { cancelled: false };
@@ -295,17 +310,22 @@ export async function runCrawl(o: CrawlOptions): Promise<void> {
   let crawled = 0, failed = 0, duplicates = 0, active = 0, status = "done", fatal: string | null = null;
 
   /* ----- politeness: per-host pacing, backoff and a circuit breaker ----- */
-  const hostState = new Map<string, HostState>();
+  for (const [host, state] of sharedHosts) {
+    if (!state.active && Date.now() > state.nextAt + 60_000) sharedHosts.delete(host);
+  }
+  const hostState = sharedHosts;
+  const touchedHosts = new Set<string>();
   const hs = (h: string): HostState => {
+    touchedHosts.add(h);
     let s = hostState.get(h);
-    if (!s) { s = { delay: BASE_DELAY_MS, nextAt: 0, active: 0, blocks: 0, dead: false }; hostState.set(h, s); }
+    if (!s) { s = { delay: BASE_DELAY_MS, nextAt: Date.now(), active: 0, blocks: 0, dead: false }; hostState.set(h, s); }
     return s;
   };
   const limit = (st: HostState) => (st.blocks > 0 ? 1 : PER_HOST);
   /** Waits for this host's turn. At most a couple of requests in flight, spaced out with a little jitter. False if the crawl was cancelled or the host gave up on us. */
   async function gate(host: string, robotsDelay: number): Promise<boolean> {
     const st = hs(host);
-    st.delay = Math.max(st.delay, Math.min(robotsDelay, MAX_DELAY_MS));
+    st.delay = Math.max(st.delay, robotsDelay);
     for (;;) {
       if (ctl.cancelled || st.dead) return false;
       const now = Date.now();
@@ -323,6 +343,13 @@ export async function runCrawl(o: CrawlOptions): Promise<void> {
     sql.query("UPDATE crawl_jobs SET crawled=$2, failed=$3, queued=$4, current_url=$5, duplicates=$6, note=$7, heartbeat_at=now() WHERE id=$1 RETURNING status", [o.jobId, crawled, failed, queue.length, current, duplicates, note()])
       .then((rows) => { if ((rows as { status: string }[])[0]?.status === "cancelled") ctl.cancelled = true; })
       .catch(() => {});
+
+  let currentUrl: string | null = null;
+  let progressWrite: Promise<unknown> | undefined;
+  const heartbeat = setInterval(() => {
+    if (!progressWrite) progressWrite = progress(currentUrl).finally(() => { progressWrite = undefined; });
+  }, 2000);
+  heartbeat.unref();
 
   const exists = async (url: string) => ((await sql.query("SELECT 1 FROM pages WHERE url=$1", [url])) as unknown[]).length > 0;
 
@@ -377,6 +404,8 @@ export async function runCrawl(o: CrawlOptions): Promise<void> {
     if (queue.length > before) skips.set("URLs queued from the sitemap and feeds", queue.length - before);
   }
 
+  let wake = () => {};
+
   async function visit(item: Item) {
     const u = new URL(item.url);
     const st = hs(u.host);
@@ -395,7 +424,7 @@ export async function runCrawl(o: CrawlOptions): Promise<void> {
     sectionCount.set(section(item.url), (sectionCount.get(section(item.url)) ?? 0) + 1);
     try {
       if (ctl.cancelled) return;
-      await progress(item.url);
+      currentUrl = item.url;
       // Re-checks ask "has this changed?" so unchanged pages cost the site almost nothing.
       const r = await fetchPage(item.url, o.refresh && known ? { etag: known.etag, lastModified: known.last_modified } : undefined);
 
@@ -458,8 +487,9 @@ export async function runCrawl(o: CrawlOptions): Promise<void> {
         );
         crawled++;
       }
-      if (item.depth === 0 && !o.refresh && !sitemapTried) await discover(new URL(r.finalUrl).origin, p.feeds);
       follow();
+      wake(); // Start pages already discovered while the sitemap/feed request is in flight.
+      if (!ctl.cancelled && crawled < o.maxPages && item.depth === 0 && !o.refresh && !sitemapTried) await discover(new URL(r.finalUrl).origin, p.feeds);
     } catch (e) {
       const m = e instanceof Error ? e.message : "";
       const timedOut = /abort|timeout/i.test(m);
@@ -482,24 +512,27 @@ export async function runCrawl(o: CrawlOptions): Promise<void> {
           const item = popBest()!;
           attempts++;
           active++;
-          visit(item).catch(() => { failed++; }).finally(() => { active--; progress(null).then(pump); });
+          visit(item).catch(() => { failed++; }).finally(() => { active--; pump(); });
         }
         if (!active && !queue.length) {
           // Nothing left from the links on the pages: try the sitemap before calling it done.
           // A site that has been refusing us is left alone: no sitemap probing either.
-          if (!sitemapTried && crawled < o.maxPages && ![...hostState.values()].some((h) => h.blocks > 0)) { active++; discover(new URL(seed).origin, []).catch(() => {}).finally(() => { active--; pump(); }); return; }
+          if (!sitemapTried && crawled < o.maxPages && ![...touchedHosts].some((host) => (hostState.get(host)?.blocks ?? 0) > 0)) { active++; discover(new URL(seed).origin, []).catch(() => {}).finally(() => { active--; pump(); }); return; }
           resolve();
         }
       };
+      wake = pump;
       pump();
     });
     if (ctl.cancelled) status = "cancelled";
   } catch (e) {
     status = "failed"; fatal = e instanceof Error ? e.message : String(e);
   } finally {
+    await maintainIndex();
+    clearInterval(heartbeat);
+    await progressWrite;
+    if (ctl.cancelled) status = "cancelled";
     running.delete(o.jobId);
-    await refreshAuthority().catch(() => {});
-    await refreshVocab().catch(() => {});   // new pages bring new words for "Did you mean"
     await sql.query("UPDATE crawl_jobs SET status=$2, crawled=$3, failed=$4, queued=$5, current_url=$6, duplicates=$7, note=$8, finished_at=now() WHERE id=$1", [o.jobId, status, crawled, failed, queue.length, fatal, duplicates, note()]);
   }
 }
