@@ -2,12 +2,13 @@
  * Everything learned from searches and from the index itself: the search log, autocomplete, trending, related searches
  * and "Did you mean" spelling help.
  */
-import { db } from "./db";
+import { ago, db } from "./db";
+import { likeEsc, prefixRange } from "./sqlutil";
 import { looksAdult } from "./safesearch";
 
 export type Suggestion = { text: string; kind: "popular" | "person" | "title" | "trending" };
 
-const esc = (s: string) => s.replace(/[\\%_]/g, "\\$&");
+const esc = likeEsc;
 const clean = (q: string) => q.trim().toLowerCase().replace(/\s+/g, " ");
 type Rows<T> = T[];
 
@@ -19,7 +20,7 @@ export async function logQuery(q: string): Promise<void> {
   if (query.length < 2 || query.length > 80) return;
   const sql = await db();
   await sql.query("INSERT INTO search_log (query, adult) VALUES ($1, $2)", [query, looksAdult(query)]);
-  if (Math.random() < 0.02) await sql.query("DELETE FROM search_log WHERE at < now() - interval '90 days'");
+  if (Math.random() < 0.02) await sql.query(`DELETE FROM search_log WHERE at < ${ago(90, "days")}`);
 }
 
 /* ---------- autocomplete ---------- */
@@ -30,13 +31,14 @@ export async function suggestFor(q: string, safe: boolean, limit = 8): Promise<S
   if (!term) return [];
   const sql = await db();
   const like = esc(term);
+  const [lo, hi] = prefixRange(term);
   const [popular, people, titles] = await Promise.all([
     sql.query(
       `SELECT query AS text FROM search_log
-       WHERE (query LIKE $1 || '%' OR query LIKE '% ' || $1 || '%') AND query <> $2 AND ($3::boolean = false OR NOT adult) AND at > now() - interval '90 days'
-       GROUP BY query ORDER BY (query LIKE $1 || '%') DESC, count(*) DESC, max(at) DESC LIMIT 5`, [like, term, safe]).then((r) => r as unknown as Rows<{ text: string }>),
-    sql.query(`SELECT name AS text, data->>'description' AS d FROM people WHERE lower(name) LIKE $1 || '%' ORDER BY (source = 'own') DESC, name LIMIT 3`, [like]).then((r) => r as unknown as Rows<{ text: string; d: string }>),
-    sql.query(`SELECT DISTINCT title AS text FROM pages WHERE lower(title) LIKE $1 || '%' AND ($2::boolean = false OR NOT adult) ORDER BY title LIMIT 6`, [like, safe]).then((r) => r as unknown as Rows<{ text: string }>),
+       WHERE (query LIKE $1 || '%' ESCAPE '\\' OR query LIKE '% ' || $1 || '%' ESCAPE '\\') AND query <> $2 AND ($3 = 0 OR adult = 0) AND at > ${ago(90, "days")}
+       GROUP BY query ORDER BY (query LIKE $1 || '%' ESCAPE '\\') DESC, count(*) DESC, max(at) DESC LIMIT 5`, [like, term, safe]).then((r) => r as unknown as Rows<{ text: string }>),
+    sql.query(`SELECT name AS text, data->>'description' AS d FROM people WHERE lower(name) >= $1 AND lower(name) < $2 ORDER BY (source = 'own') DESC, name LIMIT 3`, [lo, hi]).then((r) => r as unknown as Rows<{ text: string; d: string }>),
+    sql.query(`SELECT DISTINCT title AS text FROM pages WHERE lower(title) >= $1 AND lower(title) < $2 AND ($3 = 0 OR adult = 0) ORDER BY title LIMIT 6`, [lo, hi, safe]).then((r) => r as unknown as Rows<{ text: string }>),
   ]);
   const out: Suggestion[] = [];
   const seen = new Set<string>([term]);
@@ -57,8 +59,8 @@ export async function trending(safe: boolean, limit = 5): Promise<Suggestion[]> 
   const sql = await db();
   const rows = (await sql.query(
     `SELECT query AS text, count(*) AS n FROM search_log
-     WHERE at > now() - interval '7 days' AND ($1::boolean = false OR NOT adult)
-     GROUP BY query ORDER BY sum(CASE WHEN at > now() - interval '2 days' THEN 3 ELSE 1 END) DESC, max(at) DESC LIMIT $2`, [safe, limit * 2])) as Rows<{ text: string }>;
+     WHERE at > ${ago(7, "days")} AND ($1 = 0 OR adult = 0)
+     GROUP BY query ORDER BY sum(CASE WHEN at > ${ago(2, "days")} THEN 3 ELSE 1 END) DESC, max(at) DESC LIMIT $2`, [safe, limit * 2])) as Rows<{ text: string }>;
   return rows.filter((r) => !(safe && looksAdult(r.text))).slice(0, limit).map((r) => ({ text: r.text, kind: "trending" as const }));
 }
 
@@ -101,7 +103,7 @@ export async function relatedSearches(q: string, titles: string[], safe: boolean
     const sql = await db();
     const rows = (await sql.query(
       `SELECT query AS text, count(*) AS n FROM search_log
-       WHERE query <> $1 AND query LIKE '%' || $2 || '%' AND ($3::boolean = false OR NOT adult) AND at > now() - interval '90 days'
+       WHERE query <> $1 AND query LIKE '%' || $2 || '%' ESCAPE '\\' AND ($3 = 0 OR adult = 0) AND at > ${ago(90, "days")}
        GROUP BY query ORDER BY count(*) DESC, max(at) DESC LIMIT 6`, [base, esc(qw[0]), safe])) as Rows<{ text: string; n: string }>;
     for (const r of rows) if (qw.every((w) => r.text.includes(w))) bump(r.text, 2 + Number(r.n));
   } catch { /* related searches are a bonus */ }
@@ -125,20 +127,39 @@ export function editDistance(a: string, b: string): number {
   return d[a.length][b.length];
 }
 
-/** Rebuilds the dictionary from the index: titles, headings, descriptions and keywords, plus people's names. */
+/** Rebuilds the dictionary from the index: titles, headings, descriptions and keywords, plus people's names. Only changes are written. */
 export async function refreshVocab(): Promise<void> {
   const sql = await db();
-  await sql.query(
-    `WITH fresh AS (
-       SELECT word, ndoc FROM ts_stat($ts$SELECT to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(h1,'') || ' ' || coalesce(site_name,'') || ' ' || coalesce(description,'') || ' ' || coalesce(keywords,'')) FROM pages$ts$)
-       WHERE length(word) BETWEEN 3 AND 24 AND word ~ '^[[:alpha:]]+$'
-     ), up AS (
-       INSERT INTO vocab (word, ndoc) SELECT word, ndoc FROM fresh ON CONFLICT (word) DO UPDATE SET ndoc = EXCLUDED.ndoc RETURNING word
-     ) DELETE FROM vocab WHERE word NOT IN (SELECT word FROM fresh)`,
-  );
-  await sql.query(
-    `INSERT INTO vocab (word, ndoc) SELECT DISTINCT lower(w), 5 FROM people, regexp_split_to_table(name, '\\s+') AS w WHERE length(w) BETWEEN 3 AND 24 AND w ~ '^[[:alpha:]]+$' ON CONFLICT (word) DO NOTHING`,
-  );
+  const count = new Map<string, number>();
+  const tally = (text: string) => {
+    for (const w of new Set(text.toLowerCase().match(/\p{L}+/gu) ?? [])) {
+      if (w.length >= 3 && w.length <= 24) count.set(w, (count.get(w) ?? 0) + 1);
+    }
+  };
+  const pages = await sql.query("SELECT coalesce(title,'') || ' ' || coalesce(h1,'') || ' ' || coalesce(site_name,'') || ' ' || coalesce(description,'') || ' ' || coalesce(keywords,'') AS t FROM pages");
+  for (const r of pages) tally(String(r.t));
+  const people = await sql.query("SELECT name FROM people");
+  const fromPeople = new Set<string>();
+  for (const r of people) for (const w of String(r.name).toLowerCase().match(/\p{L}+/gu) ?? []) if (w.length >= 3 && w.length <= 24) fromPeople.add(w);
+  for (const w of fromPeople) if (!count.has(w)) count.set(w, 5);
+
+  const have = new Map<string, number>();
+  for (const r of await sql.query("SELECT word, ndoc FROM vocab")) have.set(String(r.word), Number(r.ndoc));
+  const stmts: { text: string; params?: unknown[] }[] = [];
+  const changed = [...count].filter(([w, n]) => have.get(w) !== n);
+  for (let i = 0; i < changed.length; i += 300) {
+    const chunk = changed.slice(i, i + 300);
+    stmts.push({
+      text: `INSERT INTO vocab (word, ndoc) VALUES ${chunk.map((_, k) => `($${k * 2 + 1}, $${k * 2 + 2})`).join(",")}
+             ON CONFLICT (word) DO UPDATE SET ndoc = excluded.ndoc`,
+      params: chunk.flat(),
+    });
+  }
+  const gone = [...have.keys()].filter((w) => !count.has(w));
+  for (let i = 0; i < gone.length; i += 500) {
+    stmts.push({ text: "DELETE FROM vocab WHERE word IN (SELECT value FROM json_each($1))", params: [gone.slice(i, i + 500)] });
+  }
+  for (let i = 0; i < stmts.length; i += 20) await sql.batch(stmts.slice(i, i + 20));
 }
 
 const g = globalThis as unknown as { __marsVocabAt?: number };
@@ -146,7 +167,7 @@ const g = globalThis as unknown as { __marsVocabAt?: number };
 async function ensureVocab() {
   if (g.__marsVocabAt && Date.now() - g.__marsVocabAt < 15 * 60_000) return;
   g.__marsVocabAt = Date.now();
-  const have = ((await (await db()).query("SELECT 1 FROM vocab LIMIT 1")) as unknown[]).length > 0;
+  const have = (await (await db()).query("SELECT 1 FROM vocab LIMIT 1")).length > 0;
   const rebuild = refreshVocab().catch(() => { g.__marsVocabAt = 0; });
   if (!have) await rebuild;      // nothing to use yet: this one search has to wait
 }
@@ -164,19 +185,25 @@ export async function correctQuery(q: string): Promise<string | null> {
 
   // Whole-query match against searches people made more than once.
   const pop = (await sql.query(
-    `SELECT query AS text, count(*) AS n FROM search_log WHERE query % $1 AND query <> $1 AND NOT adult GROUP BY query HAVING count(*) >= 2 ORDER BY similarity(query, $1) DESC, count(*) DESC LIMIT 3`, [query])) as Rows<{ text: string }>;
-  const near = pop.find((r) => editDistance(r.text, query) <= Math.max(1, Math.floor(query.length / 6)));
+    `SELECT query AS text, count(*) AS n FROM search_log WHERE adult = 0 AND query <> $1 AND length(query) BETWEEN $2 AND $3 GROUP BY query HAVING count(*) >= 2 ORDER BY count(*) DESC LIMIT 200`,
+    [query, query.length - 3, query.length + 3])) as Rows<{ text: string }>;
+  const near = pop
+    .map((r) => ({ text: r.text, e: editDistance(r.text, query) }))
+    .filter((r) => r.e <= Math.max(1, Math.floor(query.length / 6)))
+    .sort((a, b) => a.e - b.e)[0];
   if (near) return near.text;
 
   const checkable = ws.filter((w) => w.length >= 4 && /^[\p{L}]+$/u.test(w));
   if (!checkable.length) return null;
-  const known = new Set(((await sql.query("SELECT word FROM vocab WHERE word = ANY($1::text[])", [checkable])) as Rows<{ word: string }>).map((r) => r.word));
+  const known = new Set((await sql.query("SELECT word FROM vocab WHERE word IN (SELECT value FROM json_each($1))", [checkable])).map((r) => String(r.word)));
   let changed = false;
   const fixed: string[] = [];
   for (const w of ws) {
     if (!checkable.includes(w) || known.has(w)) { fixed.push(w); continue; }
-    const cands = (await sql.query("SELECT word, ndoc FROM vocab WHERE word % $1 ORDER BY similarity(word, $1) DESC LIMIT 8", [w])) as Rows<{ word: string; ndoc: number }>;
     const maxEdit = w.length <= 6 ? 1 : 2;   // short words only get a one-letter fix
+    // People rarely mistype the first letter, so only words that start the same and are about as long are candidates.
+    const cands = (await sql.query(
+      "SELECT word, ndoc FROM vocab WHERE word >= $1 AND word < $2 AND length(word) BETWEEN $3 AND $4", [...prefixRange(w[0]), w.length - maxEdit, w.length + maxEdit])) as Rows<{ word: string; ndoc: number }>;
     const best = cands
       .map((c) => ({ ...c, e: editDistance(w, c.word) }))
       .filter((c) => c.e <= maxEdit && c.word[0] === w[0])      // people rarely mistype the first letter

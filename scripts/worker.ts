@@ -10,7 +10,7 @@
  * Tuning (env): WORKER_PAGES_PER_SITE=60  WORKER_DEPTH=3  WORKER_IDLE_SECONDS=60  WORKER_PAUSE_SECONDS=0
  *               WORKER_REFRESH_DAYS=7  WORKER_REFRESH_BATCH=20  WORKER_CONCURRENCY=6
  */
-import { db } from "../lib/db";
+import { NOW, ago, db } from "../lib/db";
 import { cancelCrawl, runCrawl } from "../lib/crawler";
 
 const PAGES = Number(process.env.WORKER_PAGES_PER_SITE) || 60;
@@ -51,8 +51,8 @@ async function nextSite(reserved: Set<string>): Promise<string | null> {
   const sql = await db();
   const [indexed, tried, linked] = await Promise.all([
     sql.query("SELECT DISTINCT host FROM pages").then((r) => r as unknown as { host: string }[]),
-    sql.query("SELECT seed FROM crawl_jobs WHERE created_at > now() - make_interval(days => $1)", [RETRY_AFTER_DAYS]).then((r) => r as unknown as { seed: string }[]),
-    sql.query("SELECT unnest(links) AS link FROM (SELECT links FROM pages WHERE links IS NOT NULL ORDER BY crawled_at DESC LIMIT 3000) t").then((r) => r as unknown as { link: string }[]),
+    sql.query(`SELECT seed FROM crawl_jobs WHERE created_at > ${ago("$1", "days")}`, [RETRY_AFTER_DAYS]).then((r) => r as unknown as { seed: string }[]),
+    sql.query("SELECT j.value AS link FROM (SELECT links FROM pages WHERE links IS NOT NULL ORDER BY crawled_at DESC LIMIT 3000) t, json_each(t.links) j").then((r) => r as unknown as { link: string }[]),
   ]);
   const skip = new Set([...indexed.map((r) => bare(r.host)), ...tried.map((r) => bare(new URL(r.seed).hostname))]);
   const counts = new Map<string, number>();
@@ -71,7 +71,7 @@ type Target = { seed: string; maxPages: number; maxDepth: number; queueId?: numb
 async function nextQueued(): Promise<Target | null> {
   const sql = await db();
   const rows = (await sql.query(
-    `UPDATE crawl_queue SET status = 'running', heartbeat_at = now() WHERE id = (SELECT id FROM crawl_queue WHERE status = 'pending' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
+    `UPDATE crawl_queue SET status = 'running', heartbeat_at = ${NOW} WHERE id = (SELECT id FROM crawl_queue WHERE status = 'pending' ORDER BY id LIMIT 1)
      RETURNING id, url, max_pages, max_depth`,
   )) as { id: string; url: string; max_pages: number; max_depth: number }[];
   const r = rows[0];
@@ -83,7 +83,7 @@ async function stalePages(): Promise<string[]> {
   const sql = await db();
   const rows = (await sql.query(
     `SELECT url FROM (SELECT url, crawled_at, row_number() OVER (PARTITION BY host ORDER BY crawled_at) AS rn
-                      FROM pages WHERE crawled_at < now() - make_interval(days => $1)) t
+                      FROM pages WHERE crawled_at < ${ago("$1", "days")}) t
      WHERE rn <= 3 ORDER BY crawled_at LIMIT $2`,
     [REFRESH_DAYS, REFRESH_BATCH],
   )) as { url: string }[];
@@ -119,7 +119,7 @@ async function crawlSite(target: Target) {
   log(`crawling ${seed} (job ${job.id})`);
   let leaseWrite: Promise<unknown> | undefined;
   const lease = setInterval(() => {
-    if (target.queueId && !leaseWrite) leaseWrite = sql.query("UPDATE crawl_queue SET heartbeat_at=now() WHERE id=$1 AND status='running'", [target.queueId])
+    if (target.queueId && !leaseWrite) leaseWrite = sql.query(`UPDATE crawl_queue SET heartbeat_at=${NOW} WHERE id=$1 AND status='running'`, [target.queueId])
       .catch((error) => log(`queue heartbeat failed: ${error instanceof Error ? error.message : error}`))
       .finally(() => { leaseWrite = undefined; });
   }, 10_000);
@@ -145,7 +145,7 @@ async function main() {
   let recoveryAt = 0;
   const recover = async () => {
     if (Date.now() - recoveryAt < 60_000) return;
-    await sql.query("UPDATE crawl_queue SET status='pending', heartbeat_at=NULL WHERE status='running' AND (heartbeat_at IS NULL OR heartbeat_at < now() - interval '2 minutes')");
+    await sql.query(`UPDATE crawl_queue SET status='pending', heartbeat_at=NULL WHERE status='running' AND (heartbeat_at IS NULL OR heartbeat_at < ${ago(2, "minutes")})`);
     recoveryAt = Date.now();
   };
   await recover();

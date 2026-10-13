@@ -7,7 +7,7 @@
  *
  * Needs OPENROUTER_API_KEY. The key stays on the server. The search words and the result excerpts are sent to OpenRouter.
  */
-import { db } from "./db";
+import { NOW, ago, db } from "./db";
 import { looksAdult } from "./safesearch";
 import { search } from "./search";
 import { extractAnswer } from "./overviewParse";
@@ -55,7 +55,7 @@ async function buildContext(query: string, safe: boolean): Promise<Ctx> {
   const top = (res?.results ?? []).slice(0, 5);   // fewer, shorter sources: the model reads and writes faster
   if (!top.length) return { sources: [], coverage: 0 };
   const sql = await db();
-  const rows = (await sql.query("SELECT url, left(coalesce(description, ''), 300) AS d, left(coalesce(body, ''), 800) AS b FROM pages WHERE url = ANY($1::text[])", [top.map((r) => r.url)])) as unknown as { url: string; d: string; b: string }[];
+  const rows = (await sql.query("SELECT url, substr(coalesce(description, ''), 1, 300) AS d, substr(coalesce(body, ''), 1, 800) AS b FROM pages WHERE url IN (SELECT value FROM json_each($1))", [top.map((r) => r.url)])) as unknown as { url: string; d: string; b: string }[];
   const by = new Map(rows.map((r) => [r.url, r]));
   const sources = top.map((r, i) => {
     const row = by.get(r.url);
@@ -106,7 +106,7 @@ type Cached = { basis: "sources" | "knowledge"; body: string; sources: OverviewS
 async function readCache(q: string, safe: boolean): Promise<Cached | null> {
   try {
     const sql = await db();
-    const rows = (await sql.query(`SELECT basis, body, sources FROM overviews WHERE query_key=$1 AND safe=$2 AND created_at > now() - make_interval(hours => ${CACHE_HOURS})`, [keyOf(q), safe])) as unknown as Cached[];
+    const rows = (await sql.query(`SELECT basis, body, sources FROM overviews WHERE query_key=$1 AND safe=$2 AND created_at > ${ago(CACHE_HOURS, "hours")}`, [keyOf(q), safe])) as unknown as Cached[];
     return rows[0] ?? null;
   } catch { return null; }
 }
@@ -114,10 +114,10 @@ async function writeCache(q: string, safe: boolean, c: Cached) {
   try {
     const sql = await db();
     await sql.query(
-      `INSERT INTO overviews (query_key, safe, basis, body, sources, created_at) VALUES ($1,$2,$3,$4,$5, now())
-       ON CONFLICT (query_key, safe) DO UPDATE SET basis=EXCLUDED.basis, body=EXCLUDED.body, sources=EXCLUDED.sources, created_at=now()`,
+      `INSERT INTO overviews (query_key, safe, basis, body, sources, created_at) VALUES ($1,$2,$3,$4,$5, ${NOW})
+       ON CONFLICT (query_key, safe) DO UPDATE SET basis=excluded.basis, body=excluded.body, sources=excluded.sources, created_at=${NOW}`,
       [keyOf(q), safe, c.basis, c.body, JSON.stringify(c.sources)]);
-    if (Math.random() < 0.05) await sql.query("DELETE FROM overviews WHERE created_at < now() - interval '14 days'");
+    if (Math.random() < 0.05) await sql.query(`DELETE FROM overviews WHERE created_at < ${ago(14, "days")}`);
   } catch { /* the cache is optional */ }
 }
 

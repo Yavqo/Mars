@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import * as cheerio from "cheerio";
 import { getDomain } from "tldts";
-import { db } from "./db";
+import { NOW, ago, db } from "./db";
 import { refreshVocab } from "./queries";
 import { adultScore } from "./safesearch";
 
@@ -264,9 +264,9 @@ async function sitemapUrls(origin: string, declared: string[], limit = 300): Pro
 export async function refreshAuthority(): Promise<void> {
   const sql = await db();
   await sql.query(
-    `UPDATE pages p SET inlinks = c.n
-     FROM (SELECT t.url, count(DISTINCT s.host)::int AS n FROM pages s CROSS JOIN LATERAL unnest(s.links) AS t(url) GROUP BY t.url) c
-     WHERE p.url = c.url AND p.inlinks IS DISTINCT FROM c.n`,
+    `UPDATE pages SET inlinks = c.n
+     FROM (SELECT j.value AS url, count(DISTINCT s.host) AS n FROM pages s, json_each(s.links) j WHERE s.links IS NOT NULL GROUP BY j.value) c
+     WHERE pages.url = c.url AND pages.inlinks IS NOT c.n`,
   );
 }
 
@@ -340,7 +340,7 @@ export async function runCrawl(o: CrawlOptions): Promise<void> {
 
   // Also the heartbeat, and the way a cancel from another process (the admin page) reaches this crawl.
   const progress = (current: string | null) =>
-    sql.query("UPDATE crawl_jobs SET crawled=$2, failed=$3, queued=$4, current_url=$5, duplicates=$6, note=$7, heartbeat_at=now() WHERE id=$1 RETURNING status", [o.jobId, crawled, failed, queue.length, current, duplicates, note()])
+    sql.query(`UPDATE crawl_jobs SET crawled=$2, failed=$3, queued=$4, current_url=$5, duplicates=$6, note=$7, heartbeat_at=${NOW} WHERE id=$1 RETURNING status`, [o.jobId, crawled, failed, queue.length, current, duplicates, note()])
       .then((rows) => { if ((rows as { status: string }[])[0]?.status === "cancelled") ctl.cancelled = true; })
       .catch(() => {});
 
@@ -389,7 +389,7 @@ export async function runCrawl(o: CrawlOptions): Promise<void> {
   const dropPage = (url: string) => sql.query("DELETE FROM pages WHERE url=$1", [url]);
   /** A page that could not be re-checked is retried tomorrow, not on every pass. */
   const retryTomorrow = (url: string) =>
-    sql.query("UPDATE pages SET crawled_at = now() - make_interval(days => $2) WHERE url=$1", [url, Math.max(o.refresh!.staleDays - 1, 0)]).catch(() => {});
+    sql.query(`UPDATE pages SET crawled_at = ${ago("$2", "days")} WHERE url=$1`, [url, Math.max(o.refresh!.staleDays - 1, 0)]).catch(() => {});
 
   /** After the first page: the sitemap and RSS feeds list a site's real content, so they go ahead of menu and footer links. */
   async function discover(origin: string, feeds: string[]) {
@@ -440,7 +440,7 @@ export async function runCrawl(o: CrawlOptions): Promise<void> {
       } else if (r.status < 400) st.blocks = 0;
 
       if (item.depth === 0) sites.add(siteOf(new URL(r.finalUrl).hostname));
-      if (r.notModified) { await sql.query("UPDATE pages SET crawled_at = now() WHERE url=$1", [item.url]); skip("pages unchanged since the last visit"); return; }
+      if (r.notModified) { await sql.query(`UPDATE pages SET crawled_at = ${NOW} WHERE url=$1`, [item.url]); skip("pages unchanged since the last visit"); return; }
       if (!r.html) {
         if (o.refresh && (r.status === 404 || r.status === 410)) { await dropPage(item.url); skip("pages removed (no longer exist)"); return; }
         if (o.refresh) await retryTomorrow(item.url);
@@ -475,13 +475,13 @@ export async function runCrawl(o: CrawlOptions): Promise<void> {
         await sql.query(
           `INSERT INTO pages (url, host, title, description, body, favicon, site_name, canonical_url, lang, keywords, author, og_image, h1,
              published_at, status_code, content_type, word_count, link_count, depth, crawl_job_id, links, adult, adult_score, etag, last_modified, content_hash, crawled_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26, now())
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26, ${NOW})
            ON CONFLICT (url) DO UPDATE SET host=EXCLUDED.host, title=EXCLUDED.title, description=EXCLUDED.description, body=EXCLUDED.body,
              favicon=EXCLUDED.favicon, site_name=EXCLUDED.site_name, canonical_url=EXCLUDED.canonical_url, lang=EXCLUDED.lang,
              keywords=EXCLUDED.keywords, author=EXCLUDED.author, og_image=EXCLUDED.og_image, h1=EXCLUDED.h1, published_at=EXCLUDED.published_at,
              status_code=EXCLUDED.status_code, content_type=EXCLUDED.content_type, word_count=EXCLUDED.word_count, link_count=EXCLUDED.link_count,
              depth=EXCLUDED.depth, crawl_job_id=EXCLUDED.crawl_job_id, links=EXCLUDED.links, adult=EXCLUDED.adult, adult_score=EXCLUDED.adult_score,
-             etag=EXCLUDED.etag, last_modified=EXCLUDED.last_modified, content_hash=EXCLUDED.content_hash, crawled_at=now(), indexed_at=now()`,
+             etag=EXCLUDED.etag, last_modified=EXCLUDED.last_modified, content_hash=EXCLUDED.content_hash, crawled_at=${NOW}, indexed_at=${NOW}`,
           [p.url, p.host, p.title, p.description, p.body, p.favicon, p.siteName, p.canonical, p.lang, p.keywords, p.author, p.ogImage, p.h1,
            p.publishedAt, r.status, r.type.split(";")[0], p.wordCount, p.links.length, item.depth, o.jobId, p.links, p.adult, p.adultScore, r.etag ?? null, r.lastModified ?? null, hash],
         );
@@ -533,6 +533,6 @@ export async function runCrawl(o: CrawlOptions): Promise<void> {
     await progressWrite;
     if (ctl.cancelled) status = "cancelled";
     running.delete(o.jobId);
-    await sql.query("UPDATE crawl_jobs SET status=$2, crawled=$3, failed=$4, queued=$5, current_url=$6, duplicates=$7, note=$8, finished_at=now() WHERE id=$1", [o.jobId, status, crawled, failed, queue.length, fatal, duplicates, note()]);
+    await sql.query(`UPDATE crawl_jobs SET status=$2, crawled=$3, failed=$4, queued=$5, current_url=$6, duplicates=$7, note=$8, finished_at=${NOW} WHERE id=$1`, [o.jobId, status, crawled, failed, queue.length, fatal, duplicates, note()]);
   }
 }

@@ -1,4 +1,4 @@
-import { db } from "./db";
+import { NOW, ago, db } from "./db";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type J = any;
@@ -214,8 +214,8 @@ async function lookup(q: string, source: "own" | "wikipedia"): Promise<Person | 
   const sql = await db();
   const rows = (await sql.query(
     source === "own"
-      ? `SELECT data FROM people WHERE source = 'own' AND (lower(name) = $1 OR $1 = ANY(aliases)) LIMIT 1`
-      : `SELECT data FROM people WHERE source <> 'own' AND (lower(name) = $1 OR $1 = ANY(aliases)) AND fetched_at > now() - make_interval(days => ${FRESH_DAYS}) LIMIT 1`,
+      ? `SELECT data FROM people WHERE source = 'own' AND (lower(name) = $1 OR EXISTS (SELECT 1 FROM json_each(people.aliases) WHERE value = $1)) LIMIT 1`
+      : `SELECT data FROM people WHERE source <> 'own' AND (lower(name) = $1 OR EXISTS (SELECT 1 FROM json_each(people.aliases) WHERE value = $1)) AND fetched_at > ${ago(FRESH_DAYS, "days")} LIMIT 1`,
     [key(q)],
   )) as { data: Person }[];
   return rows[0] ? withAge(rows[0].data) : null;
@@ -224,11 +224,11 @@ async function lookup(q: string, source: "own" | "wikipedia"): Promise<Person | 
 async function saveCache(p: Person, q: string) {
   const sql = await db();
   await sql.query(
-    `INSERT INTO people (qid, name, aliases, data, source, fetched_at) VALUES ($1, $2, $3, $4, 'wikipedia', now())
-     ON CONFLICT (qid) DO UPDATE SET name = EXCLUDED.name, data = EXCLUDED.data, fetched_at = now(),
-       aliases = (SELECT array_agg(DISTINCT a) FROM unnest(people.aliases || EXCLUDED.aliases) a)
+    `INSERT INTO people (qid, name, aliases, data, source, fetched_at) VALUES ($1, $2, $3, $4, 'wikipedia', ${NOW})
+     ON CONFLICT (qid) DO UPDATE SET name = excluded.name, data = excluded.data, fetched_at = ${NOW},
+       aliases = (SELECT json_group_array(value) FROM (SELECT value FROM json_each(people.aliases) UNION SELECT value FROM json_each(excluded.aliases)))
      WHERE people.source <> 'own'`,
-    [p.qid, p.name, uniq([key(q), key(p.name)]), JSON.stringify(p)],
+    [p.qid, p.name, uniq([key(q), key(p.name)]), p],
   );
 }
 
@@ -324,9 +324,9 @@ export function inputFromPerson(p: Person, aliases: string[] = []): PersonInput 
 export async function saveOwnPerson(person: Person, aliases: string[]): Promise<void> {
   const sql = await db();
   await sql.query(
-    `INSERT INTO people (qid, name, aliases, data, source, fetched_at) VALUES ($1, $2, $3, $4, 'own', now())
-     ON CONFLICT (qid) DO UPDATE SET name = EXCLUDED.name, aliases = EXCLUDED.aliases, data = EXCLUDED.data, source = 'own', fetched_at = now()`,
-    [person.qid, person.name, uniq([key(person.name), ...aliases.map(key).filter(Boolean)]), JSON.stringify(person)],
+    `INSERT INTO people (qid, name, aliases, data, source, fetched_at) VALUES ($1, $2, $3, $4, 'own', ${NOW})
+     ON CONFLICT (qid) DO UPDATE SET name = excluded.name, aliases = excluded.aliases, data = excluded.data, source = 'own', fetched_at = ${NOW}`,
+    [person.qid, person.name, uniq([key(person.name), ...aliases.map(key).filter(Boolean)]), person],
   );
 }
 

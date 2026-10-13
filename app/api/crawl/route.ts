@@ -1,35 +1,35 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/lib/db";
+import { NOW, ago, db } from "@/lib/db";
 import { normalizeUrl, runCrawl } from "@/lib/crawler";
-import { isLocalHost } from "@/lib/local";
+import { isAdmin } from "@/lib/adminAuth";
 
 export const dynamic = "force-dynamic";
 
-const deny = () => NextResponse.json({ error: "Crawl admin is only available on localhost" }, { status: 403 });
+const deny = () => NextResponse.json({ error: "Crawl admin is for the signed-in admin only" }, { status: 403 });
 
 export async function GET(req: NextRequest) {
-  if (!isLocalHost(req.headers.get("host"))) return deny();
+  if (!(await isAdmin(req))) return deny();
   const sql = await db();
   let jobs = (await sql.query("SELECT * FROM crawl_jobs ORDER BY id DESC LIMIT 10")) as Record<string, unknown>[];
   // A running job that stopped sending heartbeats (its server or worker died) was interrupted.
   const stale = jobs.filter((j) => j.status === "running" && Date.now() - new Date(String(j.heartbeat_at)).getTime() > 60_000);
   if (stale.length) {
-    await sql.query("UPDATE crawl_jobs SET status='interrupted', finished_at=now() WHERE id = ANY($1::bigint[])", [stale.map((j) => j.id)]);
+    await sql.query(`UPDATE crawl_jobs SET status='interrupted', finished_at=${NOW} WHERE id IN (SELECT value FROM json_each($1))`, [stale.map((j) => j.id)]);
     jobs = jobs.map((j) => (stale.includes(j) ? { ...j, status: "interrupted" } : j));
   }
   const pages = await sql.query(
     "SELECT url, host, title, description, favicon, site_name, lang, word_count, link_count, depth, crawled_at FROM pages ORDER BY crawled_at DESC NULLS LAST LIMIT 40",
   );
-  const [{ total, hosts }] = (await sql.query("SELECT count(*)::int AS total, count(DISTINCT host)::int AS hosts FROM pages")) as { total: number; hosts: number }[];
+  const [{ total, hosts }] = (await sql.query("SELECT count(*) AS total, count(DISTINCT host) AS hosts FROM pages")) as { total: number; hosts: number }[];
   const [q] = (await sql.query(
-    `SELECT (SELECT count(*)::int FROM crawl_queue WHERE status = 'pending') AS queued,
-            (SELECT count(*)::int FROM pages WHERE crawled_at < now() - interval '7 days') AS stale`,
+    `SELECT (SELECT count(*) FROM crawl_queue WHERE status = 'pending') AS queued,
+            (SELECT count(*) FROM pages WHERE crawled_at < ${ago(7, "days")}) AS stale`,
   )) as { queued: number; stale: number }[];
   return NextResponse.json({ jobs, pages, total, hosts, queued: q.queued, stale: q.stale });
 }
 
 export async function POST(req: NextRequest) {
-  if (!isLocalHost(req.headers.get("host"))) return deny();
+  if (!(await isAdmin(req))) return deny();
   const body = await req.json().catch(() => ({}));
   const raw = String(body.url ?? "").trim();
   const seed = normalizeUrl(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);

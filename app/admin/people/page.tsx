@@ -1,18 +1,16 @@
-import { headers } from "next/headers";
-import { notFound } from "next/navigation";
 import type { Metadata } from "next";
 import { Logo } from "@/components/Logo";
 import { PeopleAdmin } from "@/components/PeopleAdmin";
-import { isLocalHost } from "@/lib/local";
+import { adminPassword, requireAdminPage } from "@/lib/adminAuth";
 
 export const metadata: Metadata = { title: "People – Mars" };
 export const dynamic = "force-dynamic";
 
 export default async function PeopleAdminPage() {
-  if (!isLocalHost((await headers()).get("host"))) notFound();
+  await requireAdminPage("/admin/people");
   return (
     <>
-      <header className="results-header"><Logo /><span className="meta" style={{ margin: 0 }}>People admin · localhost only</span></header>
+      <header className="results-header"><Logo /><span className="meta" style={{ margin: 0 }}>People admin</span>{adminPassword() && <form method="post" action="/api/admin/logout" style={{ marginLeft: "auto" }}><button className="btn btn-outline btn-sm">Sign out</button></form>}</header>
       <PeopleAdmin />
     </>
   );

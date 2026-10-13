@@ -9,9 +9,11 @@
     "start": "next start -p 4174",
     "worker": "tsx --env-file=.env.local scripts/worker.ts",
     "classify": "tsx --env-file=.env.local scripts/classify.ts",
+    "migrate:neon": "tsx --env-file=.env.local scripts/migrate-from-neon.ts",
     "test:crawler": "node --test tests/crawler.test.cjs"
   },
   "dependencies": {
+    "@libsql/client": "^0.18.0",
     "@neondatabase/serverless": "^1.2.0",
     "cheerio": "^1.2.0",
     "mathjs": "^15.2.0",

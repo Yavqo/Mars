@@ -8,8 +8,8 @@ import { adultScore } from "../lib/safesearch";
 
 async function main() {
   const sql = await db();
-  const rows = (await sql.query("SELECT id, url, host, title, description, left(body, 20000) AS body, adult, adult_score FROM pages")) as
-    { id: string; url: string; host: string; title: string; description: string; body: string; adult: boolean; adult_score: number }[];
+  const rows = (await sql.query("SELECT id, url, host, title, description, substr(body, 1, 20000) AS body, adult, adult_score FROM pages")) as
+    { id: number; url: string; host: string; title: string; description: string; body: string; adult: boolean; adult_score: number }[];
 
   let flagged = 0, changed = 0;
   for (const r of rows) {
