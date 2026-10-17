@@ -1,12 +1,12 @@
 /**
- * "Who's in this photo?" for the pictures on a person card. A vision model on OpenRouter (default google/gemini-2.5-flash,
- * which is good at both faces and boxes) finds the faces and names the ones it recognises.
+ * "Who's in this photo?" for the pictures on a person card. Gemini, through the Gemini API from Google AI Studio
+ * (default gemini-3.7-flash), finds the faces and names the ones it recognises.
  *
  * Privacy: only photos that are already on a card are analysed, never an uploaded or arbitrary image. A face is only labelled
  * when it is the card's own person, or when the name the model gives is a public figure Mars can confirm (an entry of our own,
  * or a human on Wikidata). Everyone else stays unlabelled, so the feature never puts a name on a private person.
  *
- * Needs OPENROUTER_API_KEY. The photo is sent to OpenRouter.
+ * Needs GEMINI_API_KEY (https://aistudio.google.com/apikey). The photo is sent to Google.
  */
 import { createHash } from "node:crypto";
 import { NOW, ago, db } from "./db";
@@ -15,15 +15,15 @@ import { getEntry, getPerson } from "./people";
 /** A face, as fractions (0–1) of the photo's width and height, with who it is. */
 export type PhotoTag = { name: string; query: string; x: number; y: number; w: number; h: number };
 
-const MODEL = () => process.env.OPENROUTER_VISION_MODEL || "google/gemini-2.5-flash";
-const BASE = () => (process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1").replace(/\/$/, "");
+const MODEL = () => process.env.GEMINI_MODEL || "gemini-3.7-flash";
+const BASE = () => (process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com/v1beta").replace(/\/$/, "");
 const CACHE_DAYS = 30;
 const MAX_PER_MINUTE = 10;
 const MAX_FACES = 8;
 const MAX_BYTES = 6_000_000;
 const TIMEOUT_MS = 45_000;
 
-export const photoTagsEnabled = () => !!process.env.OPENROUTER_API_KEY;
+export const photoTagsEnabled = () => !!process.env.GEMINI_API_KEY;
 
 export class PhotoTagError extends Error {
   constructor(message: string, public status: number) { super(message); }
@@ -60,16 +60,16 @@ async function writeCache(key: string, tags: PhotoTag[]) {
 
 /* ---------- the model ---------- */
 
-/** The photo as a data URL, so the model's provider does not have to fetch it itself. Too big or unreachable: the plain URL. */
-async function imagePart(src: string): Promise<string> {
-  try {
-    const res = await fetch(src, { headers: { "User-Agent": "MarsSearch/0.1 (photo tags)" }, signal: AbortSignal.timeout(10_000), cache: "no-store" });
-    const type = res.headers.get("content-type")?.split(";")[0].trim() ?? "";
-    const size = Number(res.headers.get("content-length") ?? 0);
-    if (!res.ok || !/^image\/(jpeg|png|webp|gif)$/.test(type) || size > MAX_BYTES) return src;
-    const buf = Buffer.from(await res.arrayBuffer());
-    return buf.length > MAX_BYTES ? src : `data:${type};base64,${buf.toString("base64")}`;
-  } catch { return src; }
+/** The photo's bytes, sent inline: Gemini does not fetch image URLs itself. */
+async function imagePart(src: string): Promise<{ inline_data: { mime_type: string; data: string } }> {
+  const res = await fetch(src, { headers: { "User-Agent": "MarsSearch/0.1 (photo tags)" }, signal: AbortSignal.timeout(10_000), cache: "no-store" })
+    .catch(() => { throw new PhotoTagError("The photo could not be downloaded.", 502); });
+  const type = res.headers.get("content-type")?.split(";")[0].trim() ?? "";
+  if (!res.ok || !/^image\/(jpeg|png|webp|heic|heif)$/.test(type)) throw new PhotoTagError("The photo could not be downloaded.", 502);
+  if (Number(res.headers.get("content-length") ?? 0) > MAX_BYTES) throw new PhotoTagError("The photo is too large to analyse.", 413);
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length > MAX_BYTES) throw new PhotoTagError("The photo is too large to analyse.", 413);
+  return { inline_data: { mime_type: type, data: buf.toString("base64") } };
 }
 
 function prompt(subject: string): string {
@@ -94,29 +94,24 @@ function parseFaces(text: string): Face[] {
 }
 
 async function askModel(src: string, subject: string): Promise<Face[]> {
-  const res = await fetch(`${BASE()}/chat/completions`, {
+  const image = await imagePart(src);
+  const res = await fetch(`${BASE()}/models/${encodeURIComponent(MODEL())}:generateContent`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": process.env.OPENROUTER_REFERER || "http://localhost:4174",
-      "X-Title": "Mars Search",
-    },
+    headers: { "x-goog-api-key": process.env.GEMINI_API_KEY ?? "", "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: MODEL(),
-      temperature: 0,
-      max_tokens: 1200,
-      reasoning: { exclude: true },
-      messages: [{ role: "user", content: [
-        { type: "text", text: prompt(subject) },
-        { type: "image_url", image_url: { url: await imagePart(src) } },
-      ] }],
+      contents: [{ role: "user", parts: [image, { text: prompt(subject) }] }],
+      generationConfig: { temperature: 0, responseMimeType: "application/json" },
     }),
     signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
-  if (!res.ok) throw new PhotoTagError(res.status === 429 ? "The photo service is busy. Try again in a minute." : "The photo could not be analysed.", 502);
+  }).catch(() => { throw new PhotoTagError("The photo could not be analysed.", 502); });
+  if (!res.ok) {
+    console.warn(`[photo tags] Gemini returned ${res.status}: ${(await res.text().catch(() => "")).slice(0, 300)}`);
+    throw new PhotoTagError(res.status === 429 ? "The photo service is busy. Try again in a minute." : "The photo could not be analysed.", 502);
+  }
   const data = await res.json().catch(() => null);
-  return parseFaces(String(data?.choices?.[0]?.message?.content ?? ""));
+  // Thinking models can return thought parts first; only the answer parts count.
+  const parts: { text?: string; thought?: boolean }[] = data?.candidates?.[0]?.content?.parts ?? [];
+  return parseFaces(parts.filter((p) => !p.thought).map((p) => p.text ?? "").join(""));
 }
 
 /* ---------- putting names on faces ---------- */
