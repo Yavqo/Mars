@@ -1,4 +1,5 @@
 import type { Person } from "@/lib/people";
+import { photoTagsEnabled } from "@/lib/photoTags";
 import { PersonGallery } from "./PersonGallery";
 
 const Plus = () => (
@@ -39,7 +40,7 @@ export function PersonPanel({ p }: { p: Person }) {
   return (
     <article className="pp" aria-label={`About ${p.name}`}>
       <div className="pp-layout">
-        {photos.length > 0 && <PersonGallery key={p.qid} name={p.name} images={photos} credit={p.source === "wikipedia"} />}
+        {photos.length > 0 && <PersonGallery key={p.qid} qid={p.qid} name={p.name} images={photos} credit={p.source === "wikipedia"} tagging={photoTagsEnabled()} />}
 
         <aside className="pp-panel">
           <div className="pp-eyebrow">

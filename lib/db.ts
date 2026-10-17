@@ -89,6 +89,12 @@ const SCHEMA = [
     fetched_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
   `CREATE INDEX IF NOT EXISTS people_name_idx ON people (lower(name))`,
+  // Faces found in person-card photos, so a photo is only sent to the vision model once.
+  `CREATE TABLE IF NOT EXISTS photo_tags (
+    key        TEXT PRIMARY KEY,
+    tags       TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
   // Full-text index: title > heading/site/keywords/host ("meta") > description > body. Kept in step with pages by triggers.
   `CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(title, meta, description, body, tokenize = 'porter unicode61 remove_diacritics 2')`,
   `CREATE TRIGGER IF NOT EXISTS pages_fts_ai AFTER INSERT ON pages BEGIN
@@ -114,7 +120,7 @@ export const ago = (n: string | number, unit: "days" | "hours" | "minutes") =>
 /** Columns stored as 0/1 that the code treats as booleans. */
 const BOOLS = new Set(["adult", "same_host", "safe"]);
 /** Columns stored as JSON text (arrays and objects). */
-const JSON_COLS = new Set(["links", "aliases", "data", "sources"]);
+const JSON_COLS = new Set(["links", "aliases", "data", "sources", "tags"]);
 
 export type Row = Record<string, unknown>;
 export type Sql = {

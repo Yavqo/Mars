@@ -189,6 +189,22 @@ html { scroll-behavior: smooth; }
 .pg-main img { display: block; width: 100%; height: 100%; object-fit: cover; }
 .chip { display: inline-flex; align-items: center; height: 32px; padding: 0 14px; border-radius: var(--y-radius-pill); font-size: 14px; line-height: 20px; letter-spacing: -0.14px; background: rgba(255,255,255,.7); -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px); color: var(--y-ink); }
 .pg-chip { position: absolute; top: 16px; right: 16px; }
+.pg-tools { position: absolute; left: 16px; bottom: 16px; right: 16px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; pointer-events: none; }
+.pg-tools > * { pointer-events: auto; }
+.pg-who { gap: 8px; border: 0; font: 700 14px/20px var(--y-font); cursor: pointer; transition: background-color var(--y-base) ease-out; }
+.pg-who:hover { background: rgba(255,255,255,.9); }
+.pg-who:disabled { cursor: progress; animation: ov-pulse 1.4s ease-in-out infinite; }
+.pg-who svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
+.pg-note { font-size: 13px; color: var(--y-muted); }
+/* A name bubble sits just above a face; its anchor point is the top centre of the face. */
+.pg-tag { position: absolute; width: 0; height: 0; z-index: 1; pointer-events: none; animation: pg-pop .25s var(--y-ease-soft) both; }
+.pg-tag-name { position: absolute; left: 0; bottom: 8px; transform: translateX(-50%); pointer-events: auto; white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; padding: 6px 12px; border-radius: var(--y-radius-pill); background: rgba(255,255,255,.88); -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px); color: var(--y-ink); font: 700 13px/18px var(--y-font); box-shadow: 0 4px 16px rgba(0,0,0,.18); transition: background-color var(--y-base) ease-out, color var(--y-base) ease-out; }
+.pg-tag-name::after { content: ""; position: absolute; left: 50%; top: 100%; transform: translateX(-50%); border: 6px solid transparent; border-top-color: rgba(255,255,255,.88); transition: border-top-color var(--y-base) ease-out; }
+.pg-face { position: absolute; left: calc(var(--face-w) / -2); top: var(--face-dy); width: var(--face-w); height: var(--face-h); border: 2px solid #fff; border-radius: 12px; box-shadow: 0 0 0 1px rgba(0,0,0,.2); opacity: 0; transition: opacity var(--y-base) ease-out; pointer-events: none; }
+.pg-tag-name:hover, .pg-tag-name:focus-visible { background: var(--y-blue); color: #fff; outline: none; }
+.pg-tag-name:hover::after, .pg-tag-name:focus-visible::after { border-top-color: var(--y-blue); }
+.pg-tag-name:hover + .pg-face, .pg-tag-name:focus-visible + .pg-face { opacity: 1; }
+@keyframes pg-pop { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .pg-thumbs { display: flex; gap: 12px; margin-top: 16px; }
 .pg-thumb { width: 72px; height: 72px; padding: 0; border: 2px solid transparent; border-radius: var(--y-radius-swatch); background: var(--y-soft-media); overflow: hidden; cursor: pointer; transition: border-color var(--y-base) ease-out; }
 .pg-thumb img { display: block; width: 100%; height: 100%; object-fit: cover; }
