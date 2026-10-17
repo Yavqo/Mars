@@ -1,12 +1,18 @@
 /**
- * AI overview: a short written answer above the results, from an OpenRouter model (default liquid/lfm-2.5-2.6b:free).
+ * AI overview: a short written answer above the results, from Gemini through the Gemini API (default gemini-3.8-flash).
  *
  * Order of trust: Mars's own search results first. The model gets the top results' text and must answer from them, with
  * numbered citations. If those results do not contain the answer, it says so and answers from its own knowledge, and the
  * card labels that clearly. With no results at all it goes straight to its own knowledge.
  *
- * Needs OPENROUTER_API_KEY. The key stays on the server. The search words and the result excerpts are sent to OpenRouter.
+ * The model's instructions (its system prompt) live in prompts.txt at the project root, so they can be edited without touching
+ * code. The per-search message (the search and the sources) is built here.
+ *
+ * Needs GEMINI_API_KEY. The key stays on the server. The search words and the result excerpts are sent to Google.
  */
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { NOW, ago, db } from "./db";
 import { looksAdult } from "./safesearch";
 import { search } from "./search";
@@ -20,13 +26,14 @@ export type OverviewEvent =
   | { type: "done" }
   | { type: "error"; message: string; retryable: boolean };
 
-const MODEL = () => process.env.OPENROUTER_MODEL || "liquid/lfm-2.5-2.6b:free";
-const BASE = () => (process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1").replace(/\/$/, "");
+const MODEL = () => process.env.GEMINI_OVERVIEW_MODEL || "gemini-3.8-flash";
+const BASE = () => (process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com/v1beta").replace(/\/$/, "");
+const PROMPTS_FILE = () => path.resolve(process.cwd(), process.env.OVERVIEW_PROMPTS_FILE || "prompts.txt");
 const CACHE_HOURS = 24;
-const MAX_PER_MINUTE = 15;       // the free tier allows about 20
-const TIMEOUT_MS = 75_000;   // the free tier can sit in a queue for ~10 s before the first word, and sometimes much longer
+const MAX_PER_MINUTE = 15;   // keeps a burst of searches inside the free tier's per-minute limit
+const TIMEOUT_MS = 75_000;
 
-export const overviewEnabled = () => !!process.env.OPENROUTER_API_KEY;
+export const overviewEnabled = () => !!process.env.GEMINI_API_KEY;
 
 /** Searches worth an overview: real questions or topics, not a single character, an address, or something adult while SafeSearch is on. */
 export function overviewApplies(query: string, safe: boolean): boolean {
@@ -35,7 +42,7 @@ export function overviewApplies(query: string, safe: boolean): boolean {
 }
 
 /* ---------- a simple rate limit, so a burst of searches cannot burn the free quota ---------- */
-const g = globalThis as unknown as { __marsOverviewCalls?: number[]; __marsReasoningMandatory?: Set<string> };
+const g = globalThis as unknown as { __marsOverviewCalls?: number[]; __marsThinkingFixed?: Set<string>; __marsPromptsWarned?: boolean };
 const calls = (g.__marsOverviewCalls ??= []);
 function takeSlot(): boolean {
   const now = Date.now();
@@ -71,52 +78,44 @@ async function buildContext(query: string, safe: boolean): Promise<Ctx> {
   return { sources, coverage };
 }
 
+/** The system prompt from prompts.txt, read on every overview so edits apply at once. Lines starting with # are notes. */
+async function systemPrompt(): Promise<string> {
+  try {
+    const text = (await readFile(PROMPTS_FILE(), "utf8")).split(/\r?\n/).filter((l) => !l.trimStart().startsWith("#")).join("\n").trim();
+    if (text) return text;
+  } catch { /* falls through to the warning */ }
+  if (!g.__marsPromptsWarned) { g.__marsPromptsWarned = true; console.warn(`[overview] ${PROMPTS_FILE()} is missing or empty: using a minimal built-in prompt`); }
+  return `You write the short "AI overview" at the top of the search engine Mars. Begin with one line "BASIS: SOURCES" (answered only from the given sources, with citations like [1]) or "BASIS: KNOWLEDGE" (answered from general knowledge, no citations), then 2 to 5 plain sentences.`;
+}
+
+/** The message for one search: the search itself, and the sources when Mars has good ones. */
 function prompt(query: string, ctx: Ctx | null): string {
-  const style = `Do not show your thinking or describe the task, the sources or these instructions. Your whole reply is the "BASIS:" line followed by the overview, nothing else.
-Style: plain and neutral, 2 to 5 short sentences, or at most 5 short lines that each start with "- ". No headings, no preamble, no "as an AI". Under 120 words. Write in the same language as the search. For health, legal or money questions give general facts only and suggest asking a professional.`;
-  if (!ctx) {
-    return `You write the "AI overview" at the top of a search engine called Mars.
-Search: "${query}"
-
-Mars has no matching pages, so answer from your own general knowledge. Do not invent facts; if you are not sure or do not know, say that briefly. Do not claim knowledge of recent events.
-Begin your reply with the exact line "BASIS: KNOWLEDGE", then the overview on the next line.
-${style}`;
-  }
+  if (!ctx) return `Search: "${query}"\n\nMars has no matching pages, so answer from your own general knowledge (BASIS: KNOWLEDGE).`;
   const block = ctx.sources.map((s) => `[${s.n}] ${s.title} (${s.host})\n${s.text}`).join("\n\n");
-  return `You write the "AI overview" at the top of a search engine called Mars.
-Search: "${query}"
-
-SOURCES, from Mars's own search index:
-${block}
-
-First decide whether the sources contain enough information to answer the search.
-Begin your reply with exactly one line: "BASIS: SOURCES" or "BASIS: KNOWLEDGE", then the overview on the next line.
-- BASIS: SOURCES: use only facts that appear in the sources. Add a citation like [1] or [2] after each claim. Never cite a number that is not listed. Do not add outside facts.
-- BASIS: KNOWLEDGE: the sources do not answer the search. Answer from your own general knowledge, with no citations. Do not invent facts; if you do not know, say so briefly. Do not claim knowledge of recent events.
-${style}`;
+  return `Search: "${query}"\n\nSOURCES, from Mars's own search index:\n${block}`;
 }
 
 /* ---------- cache ---------- */
 
-// The cache is per model, so switching models never serves an answer the old one wrote.
+// The cache is per model and per system prompt, so switching models or editing prompts.txt never serves an old answer.
 // "v2": overviews cached by the first version could contain the model's thinking, so they are never served.
-const keyOf = (q: string) => `v2::${MODEL()}::${q.trim().toLowerCase().replace(/\s+/g, " ")}`;
+const keyOf = (q: string, system: string) => `v2::${MODEL()}::${createHash("sha256").update(system).digest("hex").slice(0, 16)}::${q.trim().toLowerCase().replace(/\s+/g, " ")}`;
 type Cached = { basis: "sources" | "knowledge"; body: string; sources: OverviewSource[] };
 
-async function readCache(q: string, safe: boolean): Promise<Cached | null> {
+async function readCache(q: string, safe: boolean, system: string): Promise<Cached | null> {
   try {
     const sql = await db();
-    const rows = (await sql.query(`SELECT basis, body, sources FROM overviews WHERE query_key=$1 AND safe=$2 AND created_at > ${ago(CACHE_HOURS, "hours")}`, [keyOf(q), safe])) as unknown as Cached[];
+    const rows = (await sql.query(`SELECT basis, body, sources FROM overviews WHERE query_key=$1 AND safe=$2 AND created_at > ${ago(CACHE_HOURS, "hours")}`, [keyOf(q, system), safe])) as unknown as Cached[];
     return rows[0] ?? null;
   } catch { return null; }
 }
-async function writeCache(q: string, safe: boolean, c: Cached) {
+async function writeCache(q: string, safe: boolean, system: string, c: Cached) {
   try {
     const sql = await db();
     await sql.query(
       `INSERT INTO overviews (query_key, safe, basis, body, sources, created_at) VALUES ($1,$2,$3,$4,$5, ${NOW})
        ON CONFLICT (query_key, safe) DO UPDATE SET basis=excluded.basis, body=excluded.body, sources=excluded.sources, created_at=${NOW}`,
-      [keyOf(q), safe, c.basis, c.body, JSON.stringify(c.sources)]);
+      [keyOf(q, system), safe, c.basis, c.body, JSON.stringify(c.sources)]);
     if (Math.random() < 0.05) await sql.query(`DELETE FROM overviews WHERE created_at < ${ago(14, "days")}`);
   } catch { /* the cache is optional */ }
 }
@@ -140,8 +139,10 @@ export function streamOverview(query: string, safe: boolean): ReadableStream<Uin
       const send = (e: OverviewEvent) => { try { controller.enqueue(line(e)); } catch { /* client went away */ } };
       const finish = () => { try { controller.close(); } catch { /* already closed */ } };
       try {
+        const system = await systemPrompt();
+
         // 1. Cached?
-        const hit = await readCache(query, safe);
+        const hit = await readCache(query, safe, system);
         if (hit) {
           send({ type: "meta", basis: hit.basis, sources: hit.sources });
           send({ type: "delta", text: hit.body });
@@ -160,20 +161,19 @@ export function streamOverview(query: string, safe: boolean): ReadableStream<Uin
         // 3. Ask the model.
         const t0 = Date.now();
         const lap = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
-        // Reasoning: models that allow it get it switched off (a short summary does not need minutes of silent thinking: with it on,
-        // one model took 64 s, with it off 2 s). Some models make reasoning mandatory and answer 400 to that. For those the thinking
-        // is only hidden, and it needs token room because it counts against the limit. What a model refused is remembered.
-        const mandatory = (g.__marsReasoningMandatory ??= new Set<string>());
+        // Thinking is kept to a minimum: a short summary does not need it, and it delays the first word. A model that refuses
+        // that setting is asked again without it, and this is remembered. Thought parts are never shown either way.
+        const fixed = (g.__marsThinkingFixed ??= new Set<string>());
         const bodyFor = () => JSON.stringify({
-          model: MODEL(),
-          stream: true,
-          temperature: 0.3,
-          max_tokens: mandatory.has(MODEL()) ? 3000 : 1500,
-          reasoning: mandatory.has(MODEL()) ? { exclude: true } : { enabled: false, exclude: true },
-          messages: [{ role: "user", content: prompt(query, sourcesForModel) }],
+          systemInstruction: { parts: [{ text: system }] },
+          contents: [{ role: "user", parts: [{ text: prompt(query, sourcesForModel) }] }],
+          generationConfig: {
+            temperature: 0.3,
+            maxOutputTokens: 3000,
+            ...(fixed.has(MODEL()) ? {} : { thinkingConfig: { thinkingLevel: "minimal" } }),
+          },
         });
-        // The free tier sometimes leaves a request waiting in a queue for a minute or more. A request that has not started
-        // answering after 25 seconds is cancelled and sent again once, which gets a fresh place in the queue.
+        // A request that has not started answering after 25 seconds is cancelled and sent again once.
         const ask = async (firstByteMs: number): Promise<Response> => {
           const requestBody = bodyFor();
           const ctl = new AbortController();
@@ -181,14 +181,9 @@ export function streamOverview(query: string, safe: boolean): ReadableStream<Uin
           const first = setTimeout(() => ctl.abort(), firstByteMs);
           streamCtl = ctl; clearTotal = () => clearTimeout(total);
           try {
-            return await fetch(`${BASE()}/chat/completions`, {
+            return await fetch(`${BASE()}/models/${encodeURIComponent(MODEL())}:streamGenerateContent?alt=sse`, {
               method: "POST",
-              headers: {
-                Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-                "Content-Type": "application/json",
-                "HTTP-Referer": process.env.OPENROUTER_REFERER || "http://localhost:4174",
-                "X-Title": "Mars Search",
-              },
+              headers: { "x-goog-api-key": process.env.GEMINI_API_KEY ?? "", "Content-Type": "application/json" },
               body: requestBody,
               signal: ctl.signal,
             });
@@ -207,11 +202,14 @@ export function streamOverview(query: string, safe: boolean): ReadableStream<Uin
         }
         if (res.status === 400) {
           const detail = await res.text().catch(() => "");
-          if (/mandatory|cannot be disabled/i.test(detail) && !mandatory.has(MODEL())) {
-            console.log(`[overview] ${MODEL()} does not allow reasoning to be switched off: hiding it instead`);
-            mandatory.add(MODEL());
+          if (/thinking/i.test(detail) && !fixed.has(MODEL())) {
+            console.log(`[overview] ${MODEL()} does not accept the thinking setting: asking without it`);
+            fixed.add(MODEL());
             clearTotal();
             res = await ask(40_000);
+          } else if (/API_KEY_INVALID|API key not valid/i.test(detail)) {
+            send({ type: "error", retryable: false, message: "The AI overview is not set up correctly (check GEMINI_API_KEY)." });
+            return finish();
           } else {
             console.log(`[overview] "${query}": model refused the request (HTTP 400): ${detail.slice(0, 300)}`);
             send({ type: "error", retryable: false, message: "The AI overview could not be generated right now." });
@@ -221,7 +219,7 @@ export function streamOverview(query: string, safe: boolean): ReadableStream<Uin
         console.log(`[overview] "${query}": model answered HTTP ${res.status} after ${lap()} (${useSources ? ctx.sources.length + " sources" : "own knowledge"})`);
         if (!res.ok || !res.body) {
           const status = res.status;
-          send({ type: "error", retryable: status !== 401 && status !== 403, message: status === 401 || status === 403 ? "The AI overview is not set up correctly (check OPENROUTER_API_KEY)." : status === 429 ? "The AI model is rate-limited right now. Try again in a minute." : "The AI overview could not be generated right now." });
+          send({ type: "error", retryable: status !== 401 && status !== 403, message: status === 401 || status === 403 ? "The AI overview is not set up correctly (check GEMINI_API_KEY)." : status === 429 ? "The AI model is rate-limited right now. Try again in a minute." : "The AI overview could not be generated right now." });
           return finish();
         }
 
@@ -252,13 +250,17 @@ export function streamOverview(query: string, safe: boolean): ReadableStream<Uin
           let i: number;
           while ((i = buf.indexOf("\n")) >= 0) {
             const ln = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
-            if (!ln.startsWith("data:")) continue;                 // ": OPENROUTER PROCESSING" keep-alives and blanks
+            if (!ln.startsWith("data:")) continue;                 // blank lines between events
             const data = ln.slice(5).trim();
-            if (data === "[DONE]") continue;
             try {
               const j = JSON.parse(data);
-              if (j.error) { send({ type: "error", message: "The AI model returned an error. Try again in a moment.", retryable: true }); return finish(); }
-              const piece: string | undefined = j.choices?.[0]?.delta?.content;   // delta.reasoning* fields are the model's thinking: ignored
+              if (j.error || j.promptFeedback?.blockReason) {
+                console.log(`[overview] "${query}": ${j.error ? `model error ${JSON.stringify(j.error).slice(0, 200)}` : `blocked (${j.promptFeedback.blockReason})`}`);
+                send({ type: "error", message: "The AI model returned an error. Try again in a moment.", retryable: !j.promptFeedback?.blockReason });
+                return finish();
+              }
+              // Parts marked "thought" are the model's thinking: ignored.
+              const piece = ((j.candidates?.[0]?.content?.parts ?? []) as { text?: string; thought?: boolean }[]).filter((p) => !p.thought).map((p) => p.text ?? "").join("");
               if (piece) {
                 raw += piece;
                 const p = extractAnswer(raw, false, defaultBasis);
@@ -277,7 +279,7 @@ export function streamOverview(query: string, safe: boolean): ReadableStream<Uin
         answer = answer.trim();
         if (!answer) { send({ type: "error", message: "The AI model did not return an overview. Try again.", retryable: true }); return finish(); }
         send({ type: "done" });
-        await writeCache(query, safe, { basis, body: answer, sources: basis === "sources" ? citedSources(answer, publicSources) : [] });
+        await writeCache(query, safe, system, { basis, body: answer, sources: basis === "sources" ? citedSources(answer, publicSources) : [] });
       } catch (e) {
         const timedOut = e instanceof Error && /abort|timeout/i.test(e.message);
         console.log(`[overview] "${query}": failed (${e instanceof Error ? e.message : e})`);
