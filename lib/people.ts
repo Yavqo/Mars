@@ -339,6 +339,13 @@ export async function listPeople(): Promise<{ qid: string; name: string; source:
   return rows;
 }
 
+/** Saved people with a portrait, our own entries first, then the most recently cached Wikipedia ones. Used to match faces in photos. */
+export async function listPortraits(limit: number): Promise<{ qid: string; name: string; image: string }[]> {
+  return (await (await db()).query(
+    `SELECT qid, name, data->>'image' AS image FROM people WHERE coalesce(data->>'image', '') <> '' ORDER BY (source = 'own') DESC, fetched_at DESC LIMIT $1`,
+    [limit])) as { qid: string; name: string; image: string }[];
+}
+
 export async function getEntry(qid: string): Promise<{ person: Person; aliases: string[] } | null> {
   const rows = (await (await db()).query("SELECT data, aliases FROM people WHERE qid = $1", [qid])) as { data: Person; aliases: string[] }[];
   return rows[0] ? { person: rows[0].data, aliases: rows[0].aliases } : null;
