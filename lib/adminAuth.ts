@@ -1,5 +1,5 @@
 /**
- * Password for the admin pages (/crawl, /admin/people) and their APIs.
+ * Password for the admin pages (/crawl, /admin/people, /admin/companies) and their APIs.
  *  - ADMIN_PASSWORD set (Vercel environment variable): every admin request needs the signed-in cookie, wherever it runs.
  *  - ADMIN_PASSWORD not set: the admin stays open on localhost only and is closed everywhere else.
  * The cookie holds an HMAC of the password, never the password, so changing ADMIN_PASSWORD signs everyone out.

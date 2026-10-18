@@ -89,6 +89,16 @@ const SCHEMA = [
     fetched_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
   `CREATE INDEX IF NOT EXISTS people_name_idx ON people (lower(name))`,
+  // Companies: same shape as people. "own" entries come from /admin/companies and win; "wikipedia" ones are a cached fallback.
+  `CREATE TABLE IF NOT EXISTS companies (
+    qid        TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    aliases    TEXT NOT NULL DEFAULT '[]',
+    data       TEXT NOT NULL,
+    source     TEXT NOT NULL DEFAULT 'wikipedia',
+    fetched_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+  `CREATE INDEX IF NOT EXISTS companies_name_idx ON companies (lower(name))`,
   // Faces found in person-card photos, so a photo is only sent to the vision model once.
   `CREATE TABLE IF NOT EXISTS photo_tags (
     key        TEXT PRIMARY KEY,

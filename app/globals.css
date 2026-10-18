@@ -215,6 +215,7 @@ html { scroll-behavior: smooth; }
 .pp-panel { position: sticky; top: 16px; padding: 24px 20px; border: 1px solid var(--y-border); border-radius: var(--y-radius-lg); background: var(--y-canvas); }
 .pp-eyebrow { display: flex; align-items: center; gap: 8px; font-size: 14px; line-height: 20px; color: var(--y-muted); }
 .pp-eyebrow svg { width: 20px; height: 20px; flex: none; }
+.pp-eyebrow .cp-logo { width: 44px; height: 44px; flex: none; object-fit: contain; padding: 5px; border: 1px solid var(--y-border); border-radius: 12px; background: #fff; }
 .pp-name { margin: 12px 0 0; font-size: 28px; line-height: 34px; font-weight: 300; letter-spacing: normal; text-wrap: balance; }
 .pp-line { margin: 8px 0 0; font-size: 16px; line-height: 24px; color: var(--y-muted); }
 .pp-line a, .pp-panel p a { color: var(--y-blue); font-weight: 700; font-size: 14px; }

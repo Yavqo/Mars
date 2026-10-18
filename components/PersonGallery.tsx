@@ -14,7 +14,7 @@ const FaceIcon = () => (
  * Large rounded portrait with selectable thumbnails. The selected thumbnail gets a 2px blue ring.
  * With `tagging` on, "Who's in this photo?" finds the faces and puts a name bubble over each one; a bubble searches for that person.
  */
-export function PersonGallery({ qid, name, images, credit, tagging }: { qid: string; name: string; images: string[]; credit: boolean; tagging: boolean }) {
+export function PersonGallery({ qid, name, images, credit, tagging, portrait = true }: { qid: string; name: string; images: string[]; credit: boolean; tagging: boolean; portrait?: boolean }) {
   const [i, setI] = useState(0);
   const [tags, setTags] = useState<Record<string, Tagging>>({});
   const src = images[i];
@@ -60,7 +60,7 @@ export function PersonGallery({ qid, name, images, credit, tagging }: { qid: str
     <div className="pg">
       <div className="pg-main" ref={boxRef}>
         {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img ref={imgRef} src={src} alt={i === 0 ? `Portrait of ${name}` : `${name}, photo ${i + 1}`} onLoad={measure} />
+        <img ref={imgRef} src={src} alt={i === 0 ? `${portrait ? "Portrait of " : "Photo of "}${name}` : `${name}, photo ${i + 1}`} onLoad={measure} />
         {credit && <span className="chip pg-chip">Wikimedia Commons</span>}
 
         {fit && visible.map((f) => {

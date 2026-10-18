@@ -5,8 +5,10 @@ import type { Metadata } from "next";
 import { Logo } from "@/components/Logo";
 import { SearchBox } from "@/components/SearchBox";
 import { PersonPanel } from "@/components/PersonPanel";
+import { CompanyPanel } from "@/components/CompanyPanel";
 import { SafeSearchToggle } from "@/components/SafeSearchToggle";
 import { getPerson } from "@/lib/people";
+import { getCompany } from "@/lib/companies";
 import { StockCard } from "@/components/StockCard";
 import { getStockForQuery, type Stock } from "@/lib/stocks";
 import { AiOverview } from "@/components/AiOverview";
@@ -54,14 +56,17 @@ export default async function SearchPage({ searchParams }: Props) {
   let news: NewsItem[] = [];
   let answer: Answer | null = null;
   let stock: Stock | null = null;
+  let company = null;
   let personHidden = false;
+  let companyHidden = false;
   let corrected: string | null = null;
   let correctionMode: "showing" | "didyoumean" | null = null;
   if (query) {
-    // The people panel only shows on page 1, and only when the whole query is a person's name.
-    const [res, who, newsItems, instant, quote] = await Promise.all([
+    // The people and company panels only show on page 1, and only when the whole query is a person's or a company's name.
+    const [res, who, firm, newsItems, instant, quote] = await Promise.all([
       search(query, page, safe).then((d) => ({ d }), () => ({ d: null })),
       page === 1 ? soft(getPerson(query, { strict: true }).catch(() => null), null) : null,
+      page === 1 ? soft(getCompany(query, { strict: true }).catch(() => null), null) : null,
       page === 1 ? soft(getNews(query, safe), [] as NewsItem[]) : [],
       page === 1 ? soft(getAnswer(query, safe), null) : null,
       page === 1 ? soft(getStockForQuery(query).catch(() => null), null) : null,
@@ -74,10 +79,13 @@ export default async function SearchPage({ searchParams }: Props) {
     // With SafeSearch on, hide the panel for people known for adult work.
     personHidden = !!who && safe && looksAdult(`${who.description} ${who.occupations.join(" ")}`);
     person = personHidden ? null : who;
+    // A person wins when a name is both. A company known for adult work is hidden the same way.
+    companyHidden = !person && !!firm && safe && looksAdult(`${firm.description} ${firm.industries.join(" ")}`);
+    company = person || companyHidden ? null : firm;
 
     // Spelling help, for a thin result list with no panel to carry the search: fix a typo outright when that finds real
     // results ("Showing results for"), or just point at the better spelling ("Did you mean").
-    if (page === 1 && !exact && !answer && !stock && !person && (!data || data.results.length < 5 || data.note)) {
+    if (page === 1 && !exact && !answer && !stock && !person && !company && (!data || data.results.length < 5 || data.note)) {
       const c = await correctQuery(query).catch(() => null);
       if (c) {
         const alt = await search(c, 1, safe).catch(() => null);
@@ -93,17 +101,17 @@ export default async function SearchPage({ searchParams }: Props) {
 
   // Remember searches that found something, so autocomplete, trending and spelling help learn from them. Only the words are kept.
   // "nolog=1" in the address skips this for one search.
-  if (query && page === 1 && !nolog && ((data?.results.length ?? 0) > 0 || answer || stock || person || news.length > 0)) {
+  if (query && page === 1 && !nolog && ((data?.results.length ?? 0) > 0 || answer || stock || person || company || news.length > 0)) {
     after(() => logQuery(shownQuery).catch(() => {}));
   }
   // The SafeSearch switch only appears when it matters for this search: adult results were filtered out (or, with SafeSearch off,
-  // are being shown, so it can be turned back on), or the person panel was hidden. An explicit query alone does not trigger it.
-  // An AI overview sits below the special results (answer, stock, person) and above the news. It is not written for a search a calculator or a stock card already answers.
+  // are being shown, so it can be turned back on), or the person or company panel was hidden. An explicit query alone does not trigger it.
+  // An AI overview sits below the special results (answer, stock, person, company) and above the news. It is not written for a search a calculator or a stock card already answers.
   const overviewWanted = !!shownQuery && page === 1 && !answer && !stock && overviewApplies(shownQuery, safe);
   const showOverview = overviewWanted && overviewEnabled();
   // With no API key the overview cannot appear. On localhost say why instead of leaving a silent gap.
   const showSetupHint = overviewWanted && !overviewEnabled() && isLocalHost((await headers()).get("host"));
-  const showSafeSearch = !!data?.adultContent || personHidden;
+  const showSafeSearch = !!data?.adultContent || personHidden || companyHidden;
   const href = (n: number) => `/search?q=${encodeURIComponent(shownQuery)}&page=${n}`;
 
   return (
@@ -117,13 +125,14 @@ export default async function SearchPage({ searchParams }: Props) {
       {answer && <div className="answer-wrap"><AnswerCard a={answer} /></div>}
       {stock && <div className="answer-wrap"><StockCard key={stock.symbol} initial={stock} /></div>}
       {person && <div className="person-wrap"><PersonPanel key={person.qid} p={person} /></div>}
+      {company && <div className="person-wrap"><CompanyPanel key={company.qid} c={company} /></div>}
       {showSetupHint && <div className="answer-wrap"><OverviewSetup /></div>}
       {showOverview && <div className="answer-wrap"><AiOverview key={shownQuery} query={shownQuery} /></div>}
       {news.length > 0 && <div className="news-wrap"><NewsSection items={news} query={query} /></div>}
       <main className="results">
         {!query && <p className="notice">Type something to search.</p>}
         {failed && <p className="notice">Search is unavailable right now. Try again in a moment.</p>}
-        {data && data.results.length === 0 && !answer && !stock && !person && news.length === 0 && (
+        {data && data.results.length === 0 && !answer && !stock && !person && !company && news.length === 0 && (
           <p className="notice">No results for <b>{query}</b>. Check your spelling or try different words.{safe && showSafeSearch && " SafeSearch is on, so explicit results are hidden."}</p>
         )}
         {data && data.results.length > 0 && (
