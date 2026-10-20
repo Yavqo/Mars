@@ -7,10 +7,10 @@ type Shortcut = { title: string; url: string };
 const KEY = "mars.shortcuts";
 const MAX = 10;
 const DEFAULTS: Shortcut[] = [
-  { title: "YouTube", url: "https://www.youtube.com/" },
+  { title: "Yavqo", url: "https://yavqo.com/" },
   { title: "GitHub", url: "https://github.com/" },
   { title: "Wikipedia", url: "https://www.wikipedia.org/" },
-  { title: "Gmail", url: "https://mail.google.com/" },
+  { title: "Yavqo Store", url: "https://store.yavqo.com/" },
 ];
 
 // Shortcuts live only in this browser (localStorage). Nothing about them is sent to Mars or stored in its database.
