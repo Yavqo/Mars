@@ -1,5 +1,5 @@
 /**
- * AI overview: a short written answer above the results, from Gemini through the Gemini API (default gemini-3.8-flash).
+ * AI overview: a short written answer above the results, from an OpenRouter model (default minimax/minimax-m3.1-flash:free).
  *
  * Order of trust: Mars's own search results first. The model gets the top results' text and must answer from them, with
  * numbered citations. If those results do not contain the answer, it says so and answers from its own knowledge, and the
@@ -8,7 +8,7 @@
  * The model's instructions (its system prompt) live in prompts.txt at the project root, so they can be edited without touching
  * code. The per-search message (the search and the sources) is built here.
  *
- * Needs GEMINI_API_KEY. The key stays on the server. The search words and the result excerpts are sent to Google.
+ * Needs OPENROUTER_API_KEY. The key stays on the server. The search words and the result excerpts are sent to OpenRouter.
  */
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -26,14 +26,14 @@ export type OverviewEvent =
   | { type: "done" }
   | { type: "error"; message: string; retryable: boolean };
 
-const MODEL = () => process.env.GEMINI_OVERVIEW_MODEL || "gemini-3.8-flash";
-const BASE = () => (process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com/v1beta").replace(/\/$/, "");
+const MODEL = () => process.env.OPENROUTER_MODEL || "minimax/minimax-m3.1-flash:free";
+const BASE = () => (process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1").replace(/\/$/, "");
 const PROMPTS_FILE = () => path.resolve(process.cwd(), process.env.OVERVIEW_PROMPTS_FILE || "prompts.txt");
 const CACHE_HOURS = 24;
-const MAX_PER_MINUTE = 15;   // keeps a burst of searches inside the free tier's per-minute limit
-const TIMEOUT_MS = 75_000;
+const MAX_PER_MINUTE = 15;   // free models allow about 20 a minute
+const TIMEOUT_MS = 75_000;   // a free model can sit in a queue for ~10 s before the first word, and sometimes much longer
 
-export const overviewEnabled = () => !!process.env.GEMINI_API_KEY;
+export const overviewEnabled = () => !!process.env.OPENROUTER_API_KEY;
 
 /** Searches worth an overview: real questions or topics, not a single character, an address, or something adult while SafeSearch is on. */
 export function overviewApplies(query: string, safe: boolean): boolean {
@@ -42,7 +42,7 @@ export function overviewApplies(query: string, safe: boolean): boolean {
 }
 
 /* ---------- a simple rate limit, so a burst of searches cannot burn the free quota ---------- */
-const g = globalThis as unknown as { __marsOverviewCalls?: number[]; __marsThinkingFixed?: Set<string>; __marsPromptsWarned?: boolean };
+const g = globalThis as unknown as { __marsOverviewCalls?: number[]; __marsReasoningMandatory?: Set<string>; __marsPromptsWarned?: boolean };
 const calls = (g.__marsOverviewCalls ??= []);
 function takeSlot(): boolean {
   const now = Date.now();
@@ -161,19 +161,23 @@ export function streamOverview(query: string, safe: boolean): ReadableStream<Uin
         // 3. Ask the model.
         const t0 = Date.now();
         const lap = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
-        // Thinking is kept to a minimum: a short summary does not need it, and it delays the first word. A model that refuses
-        // that setting is asked again without it, and this is remembered. Thought parts are never shown either way.
-        const fixed = (g.__marsThinkingFixed ??= new Set<string>());
+        // Reasoning: models that allow it get it switched off (a short summary does not need minutes of silent thinking: with it on,
+        // one model took 64 s, with it off 2 s). Some models make reasoning mandatory and answer 400 to that. For those the thinking
+        // is only hidden, and it needs token room because it counts against the limit. What a model refused is remembered.
+        const mandatory = (g.__marsReasoningMandatory ??= new Set<string>());
         const bodyFor = () => JSON.stringify({
-          systemInstruction: { parts: [{ text: system }] },
-          contents: [{ role: "user", parts: [{ text: prompt(query, sourcesForModel) }] }],
-          generationConfig: {
-            temperature: 0.3,
-            maxOutputTokens: 3000,
-            ...(fixed.has(MODEL()) ? {} : { thinkingConfig: { thinkingLevel: "minimal" } }),
-          },
+          model: MODEL(),
+          stream: true,
+          temperature: 0.3,
+          max_tokens: mandatory.has(MODEL()) ? 3000 : 1500,
+          reasoning: mandatory.has(MODEL()) ? { exclude: true } : { enabled: false, exclude: true },
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: prompt(query, sourcesForModel) },
+          ],
         });
-        // A request that has not started answering after 25 seconds is cancelled and sent again once.
+        // The free tier sometimes leaves a request waiting in a queue for a minute or more. A request that has not started
+        // answering after 25 seconds is cancelled and sent again once, which gets a fresh place in the queue.
         const ask = async (firstByteMs: number): Promise<Response> => {
           const requestBody = bodyFor();
           const ctl = new AbortController();
@@ -181,9 +185,14 @@ export function streamOverview(query: string, safe: boolean): ReadableStream<Uin
           const first = setTimeout(() => ctl.abort(), firstByteMs);
           streamCtl = ctl; clearTotal = () => clearTimeout(total);
           try {
-            return await fetch(`${BASE()}/models/${encodeURIComponent(MODEL())}:streamGenerateContent?alt=sse`, {
+            return await fetch(`${BASE()}/chat/completions`, {
               method: "POST",
-              headers: { "x-goog-api-key": process.env.GEMINI_API_KEY ?? "", "Content-Type": "application/json" },
+              headers: {
+                Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                "Content-Type": "application/json",
+                "HTTP-Referer": process.env.OPENROUTER_REFERER || "http://localhost:4174",
+                "X-Title": "Mars Search",
+              },
               body: requestBody,
               signal: ctl.signal,
             });
@@ -202,14 +211,11 @@ export function streamOverview(query: string, safe: boolean): ReadableStream<Uin
         }
         if (res.status === 400) {
           const detail = await res.text().catch(() => "");
-          if (/thinking/i.test(detail) && !fixed.has(MODEL())) {
-            console.log(`[overview] ${MODEL()} does not accept the thinking setting: asking without it`);
-            fixed.add(MODEL());
+          if (/mandatory|cannot be disabled/i.test(detail) && !mandatory.has(MODEL())) {
+            console.log(`[overview] ${MODEL()} does not allow reasoning to be switched off: hiding it instead`);
+            mandatory.add(MODEL());
             clearTotal();
             res = await ask(40_000);
-          } else if (/API_KEY_INVALID|API key not valid/i.test(detail)) {
-            send({ type: "error", retryable: false, message: "The AI overview is not set up correctly (check GEMINI_API_KEY)." });
-            return finish();
           } else {
             console.log(`[overview] "${query}": model refused the request (HTTP 400): ${detail.slice(0, 300)}`);
             send({ type: "error", retryable: false, message: "The AI overview could not be generated right now." });
@@ -219,7 +225,7 @@ export function streamOverview(query: string, safe: boolean): ReadableStream<Uin
         console.log(`[overview] "${query}": model answered HTTP ${res.status} after ${lap()} (${useSources ? ctx.sources.length + " sources" : "own knowledge"})`);
         if (!res.ok || !res.body) {
           const status = res.status;
-          send({ type: "error", retryable: status !== 401 && status !== 403, message: status === 401 || status === 403 ? "The AI overview is not set up correctly (check GEMINI_API_KEY)." : status === 429 ? "The AI model is rate-limited right now. Try again in a minute." : "The AI overview could not be generated right now." });
+          send({ type: "error", retryable: status !== 401 && status !== 403, message: status === 401 || status === 403 ? "The AI overview is not set up correctly (check OPENROUTER_API_KEY)." : status === 429 ? "The AI model is rate-limited right now. Try again in a minute." : "The AI overview could not be generated right now." });
           return finish();
         }
 
@@ -250,17 +256,17 @@ export function streamOverview(query: string, safe: boolean): ReadableStream<Uin
           let i: number;
           while ((i = buf.indexOf("\n")) >= 0) {
             const ln = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
-            if (!ln.startsWith("data:")) continue;                 // blank lines between events
+            if (!ln.startsWith("data:")) continue;                 // ": OPENROUTER PROCESSING" keep-alives and blanks
             const data = ln.slice(5).trim();
+            if (data === "[DONE]") continue;
             try {
               const j = JSON.parse(data);
-              if (j.error || j.promptFeedback?.blockReason) {
-                console.log(`[overview] "${query}": ${j.error ? `model error ${JSON.stringify(j.error).slice(0, 200)}` : `blocked (${j.promptFeedback.blockReason})`}`);
-                send({ type: "error", message: "The AI model returned an error. Try again in a moment.", retryable: !j.promptFeedback?.blockReason });
+              if (j.error) {
+                console.log(`[overview] "${query}": model error ${JSON.stringify(j.error).slice(0, 200)}`);
+                send({ type: "error", message: "The AI model returned an error. Try again in a moment.", retryable: true });
                 return finish();
               }
-              // Parts marked "thought" are the model's thinking: ignored.
-              const piece = ((j.candidates?.[0]?.content?.parts ?? []) as { text?: string; thought?: boolean }[]).filter((p) => !p.thought).map((p) => p.text ?? "").join("");
+              const piece: string | undefined = j.choices?.[0]?.delta?.content;   // delta.reasoning* fields are the model's thinking: ignored
               if (piece) {
                 raw += piece;
                 const p = extractAnswer(raw, false, defaultBasis);
