@@ -10,7 +10,8 @@ import { adultScore } from "./safesearch";
  * Set CRAWLER_CONTACT (a URL or email) so site owners can reach you.
  */
 const CONTACT = process.env.CRAWLER_CONTACT;
-const UA = `MarsBot/0.2 (personal search engine; respects robots.txt${CONTACT ? `; +${CONTACT}` : ""})`;
+export const BOT_NAME = "YavqoBot";
+const UA = `${BOT_NAME}/1.0 (Mars search engine; respects robots.txt${CONTACT ? `; +${CONTACT}` : ""})`;
 const MAX_BYTES = 2_000_000;
 const TIMEOUT_MS = 12_000;
 const BASE_DELAY_MS = Number(process.env.CRAWLER_DELAY_MS) || 1000;   // between requests to one host
@@ -101,7 +102,8 @@ function parseRobots(txt: string): Robots {
     else if (key === "allow" && val) cur.rules.push({ allow: true, path: val });
     else if (key === "crawl-delay") cur.delay = Math.max(Number(val) || 0, 0) * 1000;
   }
-  const pick = groups.find((x) => x.agents.includes("marsbot")) ?? groups.find((x) => x.agents.includes("*"));
+  // Rules written for YavqoBot win, then ones for its old name MarsBot, then the rules for every bot.
+  const pick = groups.find((x) => x.agents.includes("yavqobot")) ?? groups.find((x) => x.agents.includes("marsbot")) ?? groups.find((x) => x.agents.includes("*"));
   return { rules: pick?.rules ?? [], delay: pick?.delay ?? 0, sitemaps };
 }
 
