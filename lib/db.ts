@@ -60,14 +60,45 @@ const SCHEMA = [
   `CREATE INDEX IF NOT EXISTS crawl_jobs_created_idx ON crawl_jobs (created_at DESC)`,
   `CREATE INDEX IF NOT EXISTS crawl_queue_pending_idx ON crawl_queue (id) WHERE status = 'pending'`,
   // What people searched (the words only: no IP, no account). Feeds suggestions, trending and spelling help.
+  // `results` is how many results the search page found: 0 means Mars could not answer it, NULL means the row is older
+  // than that count. `page` is the results page that was viewed, so a query people keep paging into shows up as thin.
   `CREATE TABLE IF NOT EXISTS search_log (
-    id     INTEGER PRIMARY KEY AUTOINCREMENT,
-    query  TEXT NOT NULL,
-    at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    adult  INTEGER NOT NULL DEFAULT 0
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    query   TEXT NOT NULL,
+    at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    adult   INTEGER NOT NULL DEFAULT 0,
+    results INTEGER,
+    page    INTEGER NOT NULL DEFAULT 1
   )`,
   `CREATE INDEX IF NOT EXISTS search_log_query_idx ON search_log (query, at DESC)`,
   `CREATE INDEX IF NOT EXISTS search_log_at_idx ON search_log (at DESC)`,
+  // A click on a result: which search it came from, what was clicked and where it sat. This is what teaches ranking.
+  `CREATE TABLE IF NOT EXISTS clicks (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    query   TEXT NOT NULL,
+    page_id INTEGER,
+    url     TEXT NOT NULL,
+    host    TEXT NOT NULL,
+    pos     INTEGER NOT NULL DEFAULT 0,
+    page    INTEGER NOT NULL DEFAULT 1,
+    at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+  `CREATE INDEX IF NOT EXISTS clicks_page_idx ON clicks (page_id, at DESC)`,
+  `CREATE INDEX IF NOT EXISTS clicks_query_idx ON clicks (query, at DESC)`,
+  `CREATE INDEX IF NOT EXISTS clicks_at_idx ON clicks (at DESC)`,
+  // One row per page: how often it was shown in results and how often it was clicked. `examined` is the same count
+  // weighted by how likely a result at that position is to be looked at, so a page shown at the top is not credited
+  // with the attention it was given. Ranking reads the ratio (see lib/search.ts).
+  `CREATE TABLE IF NOT EXISTS page_stats (
+    page_id       INTEGER PRIMARY KEY,
+    impressions   INTEGER NOT NULL DEFAULT 0,
+    examined      REAL NOT NULL DEFAULT 0,
+    clicks        INTEGER NOT NULL DEFAULT 0,
+    last_impr_at  TEXT,
+    last_click_at TEXT
+  )`,
+  // Pages that rank but never get clicked are candidates for a re-crawl or a demotion; this keeps that lookup cheap.
+  `CREATE INDEX IF NOT EXISTS page_stats_dead_idx ON page_stats (impressions DESC) WHERE clicks = 0`,
   // Every word that appears in titles, headings and descriptions of indexed pages: the dictionary for "Did you mean".
   `CREATE TABLE IF NOT EXISTS vocab (word TEXT PRIMARY KEY, ndoc INTEGER NOT NULL)`,
   // Cached AI overviews. The free model has tight request limits, so a repeated search should not call it again.
@@ -119,6 +150,18 @@ const SCHEMA = [
   `CREATE TRIGGER IF NOT EXISTS pages_fts_ad AFTER DELETE ON pages BEGIN
     DELETE FROM pages_fts WHERE rowid = old.id;
   END`,
+];
+
+/**
+ * Columns added to a table after it first shipped. `CREATE TABLE IF NOT EXISTS` leaves an existing table alone, so a
+ * new column has to be added explicitly. Each entry is applied once, when it is missing; `then` runs straight after.
+ */
+const LATE_COLUMNS: [table: string, column: string, ddl: string, then?: string][] = [
+  ["search_log", "results", "results INTEGER"],
+  ["search_log", "page", "page INTEGER NOT NULL DEFAULT 1"],
+  // Impressions from before positions were recorded have no position to weigh. They are seeded from the plain count,
+  // which treats an old impression as one at the top — the neutral guess — and ages out as new ones are logged.
+  ["page_stats", "examined", "examined REAL NOT NULL DEFAULT 0", "UPDATE page_stats SET examined = impressions WHERE examined = 0"],
 ];
 
 /** The current time as an ISO string in UTC, as SQL. Timestamps are stored in this form so they sort and compare as text. */
@@ -207,8 +250,16 @@ async function ensureSchema(sql: Sql): Promise<void> {
     const rows = await sql.query("SELECT hash FROM schema_meta LIMIT 1");
     if (rows[0]?.hash === SCHEMA_HASH) return;
   } catch { /* schema_meta does not exist yet: first run */ }
+  await sql.batch(SCHEMA.map((text) => ({ text })));
+  // Before the new fingerprint is stored: a column that was added but not recorded would never be retried.
+  for (const [table, column, ddl, then] of LATE_COLUMNS) {
+    const cols = await sql.query(`PRAGMA table_info(${table})`);
+    if (!cols.some((c) => c.name === column)) {
+      await sql.query(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+      if (then) await sql.query(then);
+    }
+  }
   await sql.batch([
-    ...SCHEMA.map((text) => ({ text })),
     { text: "CREATE TABLE IF NOT EXISTS schema_meta (hash TEXT NOT NULL)" },
     { text: "DELETE FROM schema_meta" },
     { text: "INSERT INTO schema_meta (hash) VALUES ($1)", params: [SCHEMA_HASH] },

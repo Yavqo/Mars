@@ -20,10 +20,10 @@ import { getAnswer, type Answer } from "@/lib/answers";
 import { NewsSection } from "@/components/NewsSection";
 import { getNews, type NewsItem } from "@/lib/news";
 import { Correction, RelatedSearches } from "@/components/QueryHelp";
-import { correctQuery, logQuery, relatedSearches } from "@/lib/queries";
+import { correctQuery, logImpressions, logQuery, relatedSearches } from "@/lib/queries";
 import { safeFrom } from "@/lib/safe";
 import { looksAdult } from "@/lib/safesearch";
-import { search, type SearchResponse } from "@/lib/search";
+import { PAGE_SIZE, search, type SearchResponse } from "@/lib/search";
 
 /** Gives a slow outside lookup (news, Wikidata, quotes) at most `ms` to answer. If it is late the page goes ahead without it, and the lookup keeps going in the background so the next visit finds it cached. */
 const soft = <T,>(p: Promise<T>, fallback: T, ms = 1500) => Promise.race([p, new Promise<T>((r) => setTimeout(() => r(fallback), ms))]);
@@ -99,10 +99,20 @@ export default async function SearchPage({ searchParams }: Props) {
   const shownQuery = correctionMode === "showing" && corrected ? corrected : query;
   const related = page === 1 && data && data.results.length > 0 ? await relatedSearches(shownQuery, data.results.map((r) => r.title), safe).catch(() => []) : [];
 
-  // Remember searches that found something, so autocomplete, trending and spelling help learn from them. Only the words are kept.
-  // "nolog=1" in the address skips this for one search.
-  if (query && page === 1 && !nolog && ((data?.results.length ?? 0) > 0 || answer || stock || person || company || news.length > 0)) {
-    after(() => logQuery(shownQuery).catch(() => {}));
+  // Remember the search so autocomplete, trending and spelling help learn from it, and so the ones nobody could answer
+  // show up in /admin/stats. Only the words, the number of results and which results page was viewed are kept.
+  // "nolog=1" in the address skips this for one search. A search that failed (the index was down) is not a miss.
+  if (query && !nolog && !failed) {
+    const found = data?.results.length ?? 0;
+    if (found > 0 || answer || stock || person || company || news.length > 0 || page > 1) {
+      after(() => logQuery(shownQuery, found, page).catch(() => {}));
+    }
+    // Every page of results is an impression, at the position each result was shown in: ranking needs to know not just
+    // that a page was seen but where, or the top of page one would look like proof of quality on its own.
+    if (found > 0) {
+      const shown = data!.results.map((r, i) => ({ id: r.id, pos: (page - 1) * PAGE_SIZE + i + 1 }));
+      after(() => logImpressions(shown).catch(() => {}));
+    }
   }
   // The SafeSearch switch only appears when it matters for this search: adult results were filtered out (or, with SafeSearch off,
   // are being shown, so it can be turned back on), or the person or company panel was hidden. An explicit query alone does not trigger it.
@@ -113,6 +123,10 @@ export default async function SearchPage({ searchParams }: Props) {
   const showSetupHint = overviewWanted && !overviewEnabled() && isLocalHost((await headers()).get("host"));
   const showSafeSearch = !!data?.adultContent || personHidden || companyHidden;
   const href = (n: number) => `/search?q=${encodeURIComponent(shownQuery)}&page=${n}`;
+  // Every result title links through /go, which records the click (query, position) and then redirects to the real page.
+  // Position counts from 1 across result pages, so ranking sees where a result was when it was chosen.
+  const goHref = (id: number, i: number) =>
+    `/go?id=${id}&q=${encodeURIComponent(shownQuery)}&pos=${(page - 1) * PAGE_SIZE + i + 1}&p=${page}`;
 
   return (
     <>
@@ -140,7 +154,7 @@ export default async function SearchPage({ searchParams }: Props) {
             <p className="meta">Page {page} · {(data.tookMs / 1000).toFixed(2)} seconds · via {data.source}</p>
             {data.note && <p className="notice-soft">{data.note}</p>}
             <ol className="result-list">
-              {data.results.map((r) => (
+              {data.results.map((r, i) => (
                 <li key={r.url} className="result">
                   <a href={r.url} className="result-site" tabIndex={-1} aria-hidden="true">
                     {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -150,7 +164,7 @@ export default async function SearchPage({ searchParams }: Props) {
                       <span className="result-url">{r.url}</span>
                     </span>
                   </a>
-                  <h2><a href={r.url}>{r.title}</a></h2>
+                  <h2><a href={goHref(r.id, i)}>{r.title}</a></h2>
                   <p><Snippet text={r.snippet} /></p>
                 </li>
               ))}

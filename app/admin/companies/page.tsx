@@ -11,7 +11,7 @@ export default async function CompaniesAdminPage() {
   await requireAdminPage("/admin/companies");
   return (
     <>
-      <header className="results-header"><Logo /><span className="meta" style={{ margin: 0 }}>Company admin</span><Link className="btn btn-outline btn-sm" href="/admin/people">People</Link>{adminPassword() && <form method="post" action="/api/admin/logout" style={{ marginLeft: "auto" }}><button className="btn btn-outline btn-sm">Sign out</button></form>}</header>
+      <header className="results-header"><Logo /><span className="meta" style={{ margin: 0 }}>Company admin</span><Link className="btn btn-outline btn-sm" href="/admin/people">People</Link><Link className="btn btn-outline btn-sm" href="/admin/stats">Stats</Link>{adminPassword() && <form method="post" action="/api/admin/logout" style={{ marginLeft: "auto" }}><button className="btn btn-outline btn-sm">Sign out</button></form>}</header>
       <CompaniesAdmin />
     </>
   );

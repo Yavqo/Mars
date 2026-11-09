@@ -10,6 +10,7 @@
     "worker": "tsx --env-file=.env.local scripts/worker.ts",
     "classify": "tsx --env-file=.env.local scripts/classify.ts",
     "migrate:neon": "tsx --env-file=.env.local scripts/migrate-from-neon.ts",
+    "test": "node --test tests/*.test.cjs",
     "test:crawler": "node --test tests/crawler.test.cjs"
   },
   "dependencies": {

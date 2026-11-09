@@ -21,4 +21,8 @@ Progress and cancellation are checked every two seconds without putting an extra
 
 Queue claims have heartbeats. A worker recovers claims that have gone two minutes without a heartbeat, rather than resetting all running queue entries at startup. Database setup adds indexes for host lookup and recent crawl jobs automatically on the next worker/server start.
 
-Run `npm run test:crawler` and `npx tsc --noEmit` to check the changes. The crawler tests use simulated HTTP and database responses; they do not crawl real sites or write to your database. Actual speed depends on network latency, host delays, available seeds, and database capacity. Start with six sites, then try eight if the database and machine have spare capacity. Watch `/crawl` for errors and blocking responses before increasing further.
+Run `npm run test:crawler` and `npx tsc --noEmit` to check the changes. `npm test` runs every test file. The crawler tests use simulated HTTP and database responses; they do not crawl real sites or write to your database. Actual speed depends on network latency, host delays, available seeds, and database capacity. Start with six sites, then try eight if the database and machine have spare capacity. Watch `/crawl` for errors and blocking responses before increasing further.
+
+## Where the seeds come from
+
+`/admin/stats` reads the search log back to you: the searches that returned nothing, the searches people paged deep into, and the results that keep being shown but never clicked. The words of an unanswered search are turned into a seed candidate ("tesla model 3" suggests teslamodel.com and tesla-model.com) and can be queued straight into the crawl queue in one click. Nothing is queued until you press the button, and sites already indexed or already waiting are skipped. That list is the shortest path from "Mars cannot answer this" to "Mars crawled a site that can".

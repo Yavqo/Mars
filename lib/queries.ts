@@ -2,7 +2,7 @@
  * Everything learned from searches and from the index itself: the search log, autocomplete, trending, related searches
  * and "Did you mean" spelling help.
  */
-import { ago, db } from "./db";
+import { NOW, ago, db } from "./db";
 import { likeEsc, prefixRange } from "./sqlutil";
 import { looksAdult } from "./safesearch";
 
@@ -12,15 +12,90 @@ const esc = likeEsc;
 const clean = (q: string) => q.trim().toLowerCase().replace(/\s+/g, " ");
 type Rows<T> = T[];
 
+/** A search that found nothing is not a search people would want suggested back, nor one to correct towards. */
+const FOUND = "coalesce(results, 1) > 0";
+/** Popularity counts page arrivals once per search; further result pages are counted where they matter (paging depth). */
+const FIRST_PAGE = "coalesce(page, 1) = 1";
+
 /* ---------- the log ---------- */
 
-/** Records one search. Only the words are kept. Old rows are pruned now and then. */
-export async function logQuery(q: string): Promise<void> {
+/**
+ * Records one search. Only the words are kept, plus how many results it found and which results page was viewed:
+ * a search with 0 results is a hole in the index, and a search people page deep into is a thin one.
+ * Old rows are pruned now and then.
+ */
+export async function logQuery(q: string, results: number, page = 1): Promise<void> {
   const query = clean(q);
   if (query.length < 2 || query.length > 80) return;
   const sql = await db();
-  await sql.query("INSERT INTO search_log (query, adult) VALUES ($1, $2)", [query, looksAdult(query)]);
+  await sql.query(
+    "INSERT INTO search_log (query, adult, results, page) VALUES ($1, $2, $3, $4)",
+    [query, looksAdult(query), Math.max(0, Math.trunc(results) || 0), Math.min(Math.max(Math.trunc(page) || 1, 1), 10)],
+  );
   if (Math.random() < 0.02) await sql.query(`DELETE FROM search_log WHERE at < ${ago(90, "days")}`);
+}
+
+/* ---------- the click log ---------- */
+
+export type Click = { query: string; pageId: number | null; url: string; host: string; pos: number; page: number };
+
+/**
+ * Records one click on a result. Only the search words and the page are kept, never the visitor.
+ * The per-page totals in page_stats are kept in the same transaction, so ranking never has to count clicks itself.
+ */
+export async function logClick(c: Click): Promise<void> {
+  const query = clean(c.query).slice(0, 80);
+  const sql = await db();
+  const row = { text: "INSERT INTO clicks (query, page_id, url, host, pos, page) VALUES ($1, $2, $3, $4, $5, $6)",
+    params: [query, c.pageId, c.url.slice(0, 2048), c.host.slice(0, 253), Math.max(0, Math.trunc(c.pos) || 0), Math.min(Math.max(Math.trunc(c.page) || 1, 1), 10)] };
+  await sql.batch(c.pageId
+    ? [row, { text: `INSERT INTO page_stats (page_id, clicks, last_click_at) VALUES ($1, 1, ${NOW})
+             ON CONFLICT (page_id) DO UPDATE SET clicks = clicks + 1, last_click_at = ${NOW}`, params: [c.pageId] }]
+    : [row]);
+  if (Math.random() < 0.02) await sql.query(`DELETE FROM clicks WHERE at < ${ago(180, "days")}`);
+}
+
+/** Records that these pages were shown in results, and where. One round trip for a whole page of results. */
+export async function logImpressions(shown: { id: number; pos: number }[]): Promise<void> {
+  if (!shown.length) return;
+  const sql = await db();
+  const values = shown.map((_, i) => `($${i * 2 + 1}, 1, $${i * 2 + 2}, ${NOW})`).join(",");
+  await sql.query(
+    `INSERT INTO page_stats (page_id, impressions, examined, last_impr_at) VALUES ${values}
+     ON CONFLICT (page_id) DO UPDATE SET impressions = impressions + 1, examined = examined + excluded.examined, last_impr_at = ${NOW}`,
+    shown.flatMap((s) => [s.id, examination(s.pos)]),
+  );
+}
+
+/**
+ * How likely a result is to be looked at, by the position it was shown in: 1 at the top, about 0.16 at position 10.
+ *
+ * A click at position 1 is mostly evidence of being first; a click at position 10 is mostly evidence of being wanted.
+ * Weighing the impression (rather than the click) means the ranking prior below asks a page shown at the top for more
+ * clicks before it believes them. The 1/p^0.8 shape follows published click logs; the exact exponent matters little
+ * because the prior it feeds is capped. Positions are clamped, so a page number cannot produce a weight of zero.
+ */
+export function examination(position: number): number {
+  const p = Math.min(Math.max(Math.trunc(position) || 1, 1), 100);
+  return Math.pow(p, -0.8);
+}
+
+/**
+ * Searches that led to clicks on the same pages as this one: "people also searched". Real behaviour, unlike guessing
+ * from the words in result titles, so it is the first thing related searches look at.
+ */
+export async function coClickedSearches(q: string, safe: boolean, limit = 6): Promise<string[]> {
+  const query = clean(q);
+  if (!query) return [];
+  try {
+    const sql = await db();
+    const rows = (await sql.query(
+      `SELECT c2.query AS text, count(*) AS n
+       FROM clicks c1 JOIN clicks c2 ON c2.page_id = c1.page_id AND c2.query <> c1.query
+       WHERE c1.query = $1 AND c1.page_id IS NOT NULL AND c1.at > ${ago(180, "days")} AND c2.at > ${ago(180, "days")}
+       GROUP BY c2.query ORDER BY n DESC, max(c2.at) DESC LIMIT $2`, [query, limit * 3])) as Rows<{ text: string }>;
+    return rows.map((r) => String(r.text)).filter((t) => !(safe && looksAdult(t))).slice(0, limit);
+  } catch { return []; }
 }
 
 /* ---------- autocomplete ---------- */
@@ -36,6 +111,7 @@ export async function suggestFor(q: string, safe: boolean, limit = 8): Promise<S
     sql.query(
       `SELECT query AS text FROM search_log
        WHERE (query LIKE $1 || '%' ESCAPE '\\' OR query LIKE '% ' || $1 || '%' ESCAPE '\\') AND query <> $2 AND ($3 = 0 OR adult = 0) AND at > ${ago(90, "days")}
+         AND ${FOUND} AND ${FIRST_PAGE}
        GROUP BY query ORDER BY (query LIKE $1 || '%' ESCAPE '\\') DESC, count(*) DESC, max(at) DESC LIMIT 5`, [like, term, safe]).then((r) => r as unknown as Rows<{ text: string }>),
     sql.query(`SELECT name AS text, data->>'description' AS d FROM people WHERE lower(name) >= $1 AND lower(name) < $2 ORDER BY (source = 'own') DESC, name LIMIT 3`, [lo, hi]).then((r) => r as unknown as Rows<{ text: string; d: string }>),
     sql.query(`SELECT DISTINCT title AS text FROM pages WHERE lower(title) >= $1 AND lower(title) < $2 AND ($3 = 0 OR adult = 0) ORDER BY title LIMIT 6`, [lo, hi, safe]).then((r) => r as unknown as Rows<{ text: string }>),
@@ -59,7 +135,7 @@ export async function trending(safe: boolean, limit = 5): Promise<Suggestion[]> 
   const sql = await db();
   const rows = (await sql.query(
     `SELECT query AS text, count(*) AS n FROM search_log
-     WHERE at > ${ago(7, "days")} AND ($1 = 0 OR adult = 0)
+     WHERE at > ${ago(7, "days")} AND ($1 = 0 OR adult = 0) AND ${FOUND} AND ${FIRST_PAGE}
      GROUP BY query ORDER BY sum(CASE WHEN at > ${ago(2, "days")} THEN 3 ELSE 1 END) DESC, max(at) DESC LIMIT $2`, [safe, limit * 2])) as Rows<{ text: string }>;
   return rows.filter((r) => !(safe && looksAdult(r.text))).slice(0, limit).map((r) => ({ text: r.text, kind: "trending" as const }));
 }
@@ -70,13 +146,14 @@ const STOP = new Set("a an the of and or to in on at for with from by is are was
 const words = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}' -]+/gu, " ").split(/\s+/).filter(Boolean);
 
 /**
- * Related searches: longer phrases built around the query, taken from what the top results are called,
- * plus other searches people made that share the query's words.
+ * Related searches, strongest evidence first: other searches that led to clicks on the same pages (co-clicks, real
+ * behaviour), then longer phrases built around the query taken from what the top results are called, then other
+ * searches people made that share the query's words.
  */
 export async function relatedSearches(q: string, titles: string[], safe: boolean, limit = 6): Promise<string[]> {
   const base = clean(q);
   const qw = words(base).filter((w) => !STOP.has(w));
-  if (!qw.length || base.length > 60) return [];
+  if (!base || base.length > 60) return [];
   const score = new Map<string, number>();
   const bump = (phrase: string, by: number) => {
     const p = clean(phrase);
@@ -84,8 +161,11 @@ export async function relatedSearches(q: string, titles: string[], safe: boolean
     score.set(p, (score.get(p) ?? 0) + by);
   };
 
-  // 1. Phrases around the query words in result titles ("tesla" + "model 3 review").
-  for (const title of titles) {
+  // 1. Things people searched for and then clicked the same results as this search did.
+  for (const t of await coClickedSearches(base, safe, limit)) bump(t, 12);
+
+  // 2. Phrases around the query words in result titles ("tesla" + "model 3 review").
+  for (const title of qw.length ? titles : []) {
     const tw = words(title.replace(/\s[–—|·-]\s.*$/, ""));   // drop the "- Site name" tail
     tw.forEach((w, i) => {
       if (!qw.includes(w)) return;
@@ -98,12 +178,12 @@ export async function relatedSearches(q: string, titles: string[], safe: boolean
     });
   }
 
-  // 2. Real searches that contain all of the query's words.
-  try {
+  // 3. Real searches that contain all of the query's words.
+  if (qw.length) try {
     const sql = await db();
     const rows = (await sql.query(
       `SELECT query AS text, count(*) AS n FROM search_log
-       WHERE query <> $1 AND query LIKE '%' || $2 || '%' ESCAPE '\\' AND ($3 = 0 OR adult = 0) AND at > ${ago(90, "days")}
+       WHERE query <> $1 AND query LIKE '%' || $2 || '%' ESCAPE '\\' AND ($3 = 0 OR adult = 0) AND at > ${ago(90, "days")} AND ${FOUND}
        GROUP BY query ORDER BY count(*) DESC, max(at) DESC LIMIT 6`, [base, esc(qw[0]), safe])) as Rows<{ text: string; n: string }>;
     for (const r of rows) if (qw.every((w) => r.text.includes(w))) bump(r.text, 2 + Number(r.n));
   } catch { /* related searches are a bonus */ }
@@ -185,7 +265,7 @@ export async function correctQuery(q: string): Promise<string | null> {
 
   // Whole-query match against searches people made more than once.
   const pop = (await sql.query(
-    `SELECT query AS text, count(*) AS n FROM search_log WHERE adult = 0 AND query <> $1 AND length(query) BETWEEN $2 AND $3 GROUP BY query HAVING count(*) >= 2 ORDER BY count(*) DESC LIMIT 200`,
+    `SELECT query AS text, count(*) AS n FROM search_log WHERE adult = 0 AND query <> $1 AND length(query) BETWEEN $2 AND $3 AND ${FOUND} GROUP BY query HAVING count(*) >= 2 ORDER BY count(*) DESC LIMIT 200`,
     [query, query.length - 3, query.length + 3])) as Rows<{ text: string }>;
   const near = pop
     .map((r) => ({ text: r.text, e: editDistance(r.text, query) }))

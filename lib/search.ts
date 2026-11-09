@@ -3,6 +3,8 @@ import { editDistance } from "./queries";
 import { likeEsc as esc, prefixRange } from "./sqlutil";
 
 export type SearchResult = {
+  /** The page's row id, used for the /go click link. */
+  id: number;
   title: string;
   url: string;
   host: string;
@@ -33,6 +35,10 @@ export const PAGE_SIZE = 10;
 type Cand = {
   id: number; title: string; url: string; host: string; favicon: string | null; site_name: string | null;
   description: string; adult: boolean; inlinks: number | null; word_count: number | null; rel: number;
+  /** How often the page was shown (weighted by where) and how often it was clicked. NULL until it has been seen. */
+  clicks: number | null; examined: number | null;
+  /** The index-wide totals the expected click count is worked out from. The same on every row, from the query. */
+  g_clicks: number | null; g_examined: number | null;
 };
 type Scored = Cand & { final: number };
 
@@ -86,12 +92,18 @@ const TITLE_TAIL = /\s+[—–|·-]\s+.*$/;
  *  - bonuses for an exact or leading title match, all words in the title, the query appearing in the domain, site home pages,
  *    the query being the site's own name (yavqo -> yavqo.com), and the title's first part being exactly the query
  *  - multiplied by an authority factor (how many different sites link to the page) and a penalty for thin pages
+ *  - multiplied by its click-through against the clicks it could have expected: a page at the top of the page is seen
+ *    far more often than one at the bottom, so an impression at the top counts for less and a click away from the top
+ *    counts for more. A page that keeps being shown and never clicked drifts down on its own, without anyone editing it
  *  - results from one site are gently spread out so a single domain cannot fill the whole page
  */
 function rank(cands: Cand[], q: string): Scored[] {
   const raw = q.toLowerCase().trim();
   const flat = raw.replace(/[^a-z0-9]/g, "");
   const words = termsOf(raw).filter((w) => !STOP.has(w));
+  // The index-wide click rate per examined impression: the baseline a page's own clicks are judged against.
+  const gExamined = cands[0]?.g_examined ?? 0;
+  const base = gExamined > 0 ? (cands[0]?.g_clicks ?? 0) / gExamined : 0;
   const scored = cands.map((c) => {
     const title = c.title.toLowerCase();
     const host = c.host.toLowerCase();
@@ -108,6 +120,7 @@ function rank(cands: Cand[], q: string): Scored[] {
     if (home) s += 0.25;
     s *= 1 + 0.15 * Math.log(1 + (c.inlinks ?? 0));
     if ((c.word_count ?? 0) < 40) s *= 0.6;
+    s *= clickPrior(c.clicks ?? 0, base * (c.examined ?? 0));
     return { ...c, final: s };
   }).sort((a, b) => b.final - a.final || a.id - b.id);
   // One site should not fill the page: its second result counts 0.8, the rest 0.55.
@@ -120,10 +133,27 @@ function rank(cands: Cand[], q: string): Scored[] {
   return scored.sort((a, b) => b.final - a.final || a.id - b.id);
 }
 
+/**
+ * The multiplier the click log gives a result: clicks against the clicks it could have expected, given where it was
+ * shown and how often. `expected` is `baseline rate × examined exposure`, so a page shown at the top of page one is
+ * asked for far more clicks than one shown at position 15 before it looks good.
+ *
+ * Exactly 1 (neutral) until there is something to compare with, and capped both ways: behaviour nudges the order, it
+ * does not decide it.
+ */
+export function clickPrior(clicks: number, expected: number): number {
+  const ratio = (clicks + 1) / (expected + 1);
+  return Math.min(1.35, Math.max(0.85, 1 + 0.3 * (ratio - 1)));
+}
+
 const CAND_SQL = `
   SELECT p.id, p.title, p.url, p.host, p.favicon, p.site_name, p.description, p.adult, p.inlinks, p.word_count,
+         st.clicks AS clicks, st.examined AS examined,
+         (SELECT sum(clicks) FROM page_stats) AS g_clicks,
+         (SELECT sum(examined) FROM page_stats) AS g_examined,
          -bm25(pages_fts, 20.0, 12.0, 4.0, 1.0) AS rel
   FROM pages_fts JOIN pages p ON p.id = pages_fts.rowid
+  LEFT JOIN page_stats st ON st.page_id = p.id
   WHERE pages_fts MATCH $1
   ORDER BY bm25(pages_fts, 20.0, 12.0, 4.0, 1.0)
   LIMIT 300`;
@@ -157,7 +187,7 @@ async function fuzzyTitles(q: string): Promise<Cand[]> {
   const sql = await db();
   const like = [...grams].map((_, i) => `lower(title) LIKE $${i + 1} ESCAPE '\\'`).join(" OR ");
   const rows = (await sql.query(
-    `SELECT id, title, url, host, favicon, site_name, description, adult, inlinks, word_count, 0 AS rel FROM pages WHERE ${like} LIMIT 400`,
+    `SELECT id, title, url, host, favicon, site_name, description, adult, inlinks, word_count, 0 AS rel, 0 AS clicks, 0 AS examined, 0 AS g_clicks, 0 AS g_examined FROM pages WHERE ${like} LIMIT 400`,
     [...grams].map((g) => `%${esc(g)}%`),
   )) as unknown as Cand[];
   const qw = termsOf(raw);
@@ -217,7 +247,7 @@ export async function search(q: string, page = 1, safe = true): Promise<SearchRe
     if (s && s.body.includes("\u0001")) snippet = s.body;
     else if (s && s.desc.includes("\u0001")) snippet = s.desc;
     else snippet = r.description.slice(0, 200);
-    const res: SearchResult = { title: r.title, url: r.url, host: r.host, favicon: r.favicon, siteName: r.site_name, snippet: trimSnippet(snippet) };
+    const res: SearchResult = { id: r.id, title: r.title, url: r.url, host: r.host, favicon: r.favicon, siteName: r.site_name, snippet: trimSnippet(snippet) };
     if (r.adult) res.adult = true;
     return res;
   });
