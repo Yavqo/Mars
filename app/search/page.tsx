@@ -67,7 +67,7 @@ export default async function SearchPage({ searchParams }: Props) {
       search(query, page, safe).then((d) => ({ d }), () => ({ d: null })),
       page === 1 ? soft(getPerson(query, { strict: true }).catch(() => null), null) : null,
       page === 1 ? soft(getCompany(query, { strict: true }).catch(() => null), null) : null,
-      page === 1 ? soft(getNews(query, safe), [] as NewsItem[]) : [],
+      page === 1 ? soft(getNews(query, safe), [] as NewsItem[], 2500) : [],
       page === 1 ? soft(getAnswer(query, safe), null) : null,
       page === 1 ? soft(getStockForQuery(query).catch(() => null), null) : null,
     ]);

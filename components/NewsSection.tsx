@@ -9,11 +9,14 @@ const Arrow = () => (
 export function NewsSection({ items, query }: { items: NewsItem[]; query: string }) {
   if (items.length === 0) return null;
   const now = Date.now();
+  const moreHref = items.some((n) => n.source === "Yavqo News")
+    ? `https://yavqonews.vercel.app/?q=${encodeURIComponent(query)}`
+    : `https://www.bing.com/news/search?q=${encodeURIComponent(query)}`;
   return (
     <section className="news" aria-label={`News about ${query}`}>
       <div className="news-head">
         <h2>News</h2>
-        <a className="btn btn-outline btn-sm" href={`https://www.bing.com/news/search?q=${encodeURIComponent(query)}`} target="_blank" rel="noopener noreferrer">More news</a>
+        <a className="btn btn-outline btn-sm" href={moreHref} target="_blank" rel="noopener noreferrer">More news</a>
       </div>
       <ul className="news-grid">
         {items.map((n) => (
