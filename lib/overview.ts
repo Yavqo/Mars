@@ -17,6 +17,7 @@ import { NOW, ago, db } from "./db";
 import { looksAdult } from "./safesearch";
 import { search } from "./search";
 import { extractAnswer } from "./overviewParse";
+import { limitFrom, spendToday, spentMessage } from "./throttle";
 
 export type OverviewSource = { n: number; title: string; url: string; host: string; favicon: string | null };
 export type OverviewEvent =
@@ -31,6 +32,8 @@ const BASE = () => (process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/ap
 const PROMPTS_FILE = () => path.resolve(process.cwd(), process.env.OVERVIEW_PROMPTS_FILE || "prompts.txt");
 const CACHE_HOURS = 24;
 const MAX_PER_MINUTE = 15;   // free models allow about 20 a minute
+/** Answers generated per UTC day, for every visitor together. 0 = no cap, -1 = never generate. See lib/throttle.ts. */
+const dailyCap = () => limitFrom("OVERVIEW_DAILY_CAP", 300);
 const TIMEOUT_MS = 75_000;   // a free model can sit in a queue for ~10 s before the first word, and sometimes much longer
 
 export const overviewEnabled = () => !!process.env.OPENROUTER_API_KEY;
@@ -100,16 +103,16 @@ function prompt(query: string, ctx: Ctx | null): string {
 // The cache is per model and per system prompt, so switching models or editing prompts.txt never serves an old answer.
 // "v2": overviews cached by the first version could contain the model's thinking, so they are never served.
 const keyOf = (q: string, system: string) => `v2::${MODEL()}::${createHash("sha256").update(system).digest("hex").slice(0, 16)}::${q.trim().toLowerCase().replace(/\s+/g, " ")}`;
-type Cached = { basis: "sources" | "knowledge"; body: string; sources: OverviewSource[] };
+export type CachedOverview = { basis: "sources" | "knowledge"; body: string; sources: OverviewSource[] };
 
-async function readCache(q: string, safe: boolean, system: string): Promise<Cached | null> {
+async function readCache(q: string, safe: boolean, system: string): Promise<CachedOverview | null> {
   try {
     const sql = await db();
-    const rows = (await sql.query(`SELECT basis, body, sources FROM overviews WHERE query_key=$1 AND safe=$2 AND created_at > ${ago(CACHE_HOURS, "hours")}`, [keyOf(q, system), safe])) as unknown as Cached[];
+    const rows = (await sql.query(`SELECT basis, body, sources FROM overviews WHERE query_key=$1 AND safe=$2 AND created_at > ${ago(CACHE_HOURS, "hours")}`, [keyOf(q, system), safe])) as unknown as CachedOverview[];
     return rows[0] ?? null;
   } catch { return null; }
 }
-async function writeCache(q: string, safe: boolean, system: string, c: Cached) {
+async function writeCache(q: string, safe: boolean, system: string, c: CachedOverview) {
   try {
     const sql = await db();
     await sql.query(
@@ -120,10 +123,33 @@ async function writeCache(q: string, safe: boolean, system: string, c: Cached) {
   } catch { /* the cache is optional */ }
 }
 
+/**
+ * The overview already written for this search, if there is one. The route asks first: a hit costs no model call and
+ * nothing against the daily budget, so it can be served with a short cache lifetime the browser keeps.
+ */
+export async function cachedOverview(q: string, safe: boolean): Promise<CachedOverview | null> {
+  return readCache(q, safe, await systemPrompt());
+}
+
 /* ---------- the stream ---------- */
 
 const enc = new TextEncoder();
 const line = (e: OverviewEvent) => enc.encode(`${JSON.stringify(e)}\n`);
+
+/** The events for an answer that is already known: the same NDJSON shape the stream produces, so the card cannot tell. */
+export function cachedOverviewStream(c: CachedOverview): ReadableStream<Uint8Array> {
+  const events: OverviewEvent[] = [
+    { type: "meta", basis: c.basis, sources: c.sources },
+    { type: "delta", text: c.body },
+    { type: "done" },
+  ];
+  return new ReadableStream({
+    start(controller) {
+      for (const e of events) controller.enqueue(line(e));
+      controller.close();
+    },
+  });
+}
 
 /** The sources the text actually cites (numbers stay as the model wrote them, so [2] still means source 2). If none are cited, the top three. */
 function citedSources(text: string, all: OverviewSource[]): OverviewSource[] {
@@ -132,8 +158,13 @@ function citedSources(text: string, all: OverviewSource[]): OverviewSource[] {
   return picked.length ? picked : all.slice(0, 3);
 }
 
-/** NDJSON stream of overview events: meta (basis + sources), text deltas, then done. */
-export function streamOverview(query: string, safe: boolean): ReadableStream<Uint8Array> {
+/**
+ * NDJSON stream of overview events: meta (basis + sources), text deltas, then done.
+ *
+ * `known` is the cache answer the route already looked up (null when it found none); passing it saves a second lookup.
+ * Left out, the stream reads the cache itself.
+ */
+export function streamOverview(query: string, safe: boolean, known?: CachedOverview | null): ReadableStream<Uint8Array> {
   return new ReadableStream({
     async start(controller) {
       const send = (e: OverviewEvent) => { try { controller.enqueue(line(e)); } catch { /* client went away */ } };
@@ -142,7 +173,7 @@ export function streamOverview(query: string, safe: boolean): ReadableStream<Uin
         const system = await systemPrompt();
 
         // 1. Cached?
-        const hit = await readCache(query, safe, system);
+        const hit = known === undefined ? await readCache(query, safe, system) : known;
         if (hit) {
           send({ type: "meta", basis: hit.basis, sources: hit.sources });
           send({ type: "delta", text: hit.body });
@@ -150,7 +181,15 @@ export function streamOverview(query: string, safe: boolean): ReadableStream<Uin
           return finish();
         }
 
-        // 2. Our own results first.
+        // 2. The day's budget, before the search below and before the model: a spent budget should cost neither.
+        const budget = await spendToday("overviews", dailyCap());
+        if (!budget.ok) {
+          console.log(`[overview] "${query}": not generated, daily limit reached (${budget.used}/${budget.cap})`);
+          send({ type: "error", retryable: false, message: spentMessage("The AI overview", budget) });
+          return finish();
+        }
+
+        // 3. Our own results first.
         const ctx = await buildContext(query, safe);
         const words = query.split(/[^\p{L}\p{N}]+/u).filter((w) => w.length > 2 && !STOP.has(w.toLowerCase())).length;
         const useSources = ctx.sources.length > 0 && ctx.coverage >= (words <= 3 ? 1 : 0.7);
@@ -158,7 +197,7 @@ export function streamOverview(query: string, safe: boolean): ReadableStream<Uin
 
         if (!takeSlot()) { send({ type: "error", message: "The overview is busy right now. Try again in a minute.", retryable: true }); return finish(); }
 
-        // 3. Ask the model.
+        // 4. Ask the model.
         const t0 = Date.now();
         const lap = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
         // Reasoning: models that allow it get it switched off (a short summary does not need minutes of silent thinking: with it on,
@@ -229,7 +268,7 @@ export function streamOverview(query: string, safe: boolean): ReadableStream<Uin
           return finish();
         }
 
-        // 4. Read the tokens. The first line is the BASIS tag; everything after it is the overview.
+        // 5. Read the tokens. The first line is the BASIS tag; everything after it is the overview.
         const reader = res.body.getReader();
         const dec = new TextDecoder();
         const publicSources = ctx.sources.map(({ text, ...s }) => s);

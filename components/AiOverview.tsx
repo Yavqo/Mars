@@ -61,8 +61,17 @@ export function AiOverview({ query }: { query: string }) {
     const ctl = new AbortController(); abort.current = ctl;
     setPhase("loading"); setText(""); setSources([]); setError(null); setOpen(false); setSlow(false);
     try {
-      const res = await fetch(`/api/overview?q=${encodeURIComponent(query)}`, { signal: ctl.signal, cache: "no-store" });
-      if (res.status === 204 || !res.body) { setPhase("hidden"); return; }
+      // No `cache: "no-store"`: an answer Mars already had comes back with a short private cache lifetime, so a reload
+      // can use it instead of asking the server again.
+      const res = await fetch(`/api/overview?q=${encodeURIComponent(query)}`, { signal: ctl.signal });
+      if (res.status === 204) { setPhase("hidden"); return; }
+      // Over the limit, or refused for another reason: say so instead of showing an empty card.
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => null);
+        setError({ message: data?.error ?? "The AI overview could not be loaded.", retryable: res.status === 429 });
+        setPhase("error");
+        return;
+      }
       const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "";
       for (;;) {
         const { done, value } = await reader.read();

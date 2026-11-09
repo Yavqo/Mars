@@ -14,6 +14,7 @@
 import { createHash } from "node:crypto";
 import { NOW, ago, db } from "./db";
 import { getEntry, getPerson, listPortraits } from "./people";
+import { limitFrom, spendToday, spentMessage } from "./throttle";
 
 /** A face, as fractions (0–1) of the photo's width and height, with who it is. */
 export type PhotoTag = { name: string; query: string; x: number; y: number; w: number; h: number };
@@ -22,6 +23,8 @@ const MODEL = () => process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 const BASE = () => (process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com/v1beta").replace(/\/$/, "");
 const CACHE_DAYS = 30;
 const MAX_PER_MINUTE = 10;
+/** Analyses per UTC day, for every visitor together. 0 = no cap, -1 = never generate. See lib/throttle.ts. */
+const dailyCap = () => limitFrom("PHOTO_TAGS_DAILY_CAP", 150);
 const MAX_FACES = 8;
 const MAX_BYTES = 6_000_000;
 // Reference portraits share what is left of Gemini's 20 MB limit for one request (base64 adds a third).
@@ -166,6 +169,10 @@ export async function tagPhoto(qid: string, src: string): Promise<PhotoTag[]> {
   const key = keyOf(qid, src, refs);
   const hit = await readCache(key);
   if (hit) return hit;
+  // This one needs the model and a dozen reference portraits, so it can be refused for the day. A photo that has
+  // already been analysed is free and is returned above, so an answered card keeps working when the budget is spent.
+  const budget = await spendToday("photo_tags", dailyCap());
+  if (!budget.ok) throw new PhotoTagError(spentMessage("Photo analysis", budget), 503);
   if (!takeSlot()) throw new PhotoTagError("Too many photos at once. Try again in a minute.", 429);
 
   const { faces, sent } = await askModel(src, person.name, refs);
